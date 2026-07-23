@@ -29,7 +29,9 @@ if not openai_api_key:
     st.stop()
 
 # --- הגדרת חיבור לדאטהבייס ---
-db_path = "credit_risk.db"
+# בניית נתיב דינמי ובטוח לקובץ ה-Database באותו המקום שבו נמצא app.py
+current_dir = os.path.dirname(os.path.abspath(__file__))
+db_path = os.path.join(current_dir, "credit_risk.db")
 
 if not os.path.exists(db_path):
     st.error(f"שגיאה: קובץ מסד הנתונים '{db_path}' לא נמצא בתיקייה.")
