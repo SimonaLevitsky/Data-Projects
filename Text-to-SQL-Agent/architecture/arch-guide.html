@@ -330,7 +330,7 @@ const ctr  = document.getElementById('step-ctr');
 const prev = document.getElementById('prev-btn');
 const next = document.getElementById('next-btn');
 
-function render() {
+function render(scroll = false) {
   list.innerHTML = STEPS.map((s, i) => {
     const cls = i === cur ? 'step active' : i < cur ? 'step done' : 'step';
     return `<div class="${cls}" data-i="${i}">
@@ -346,12 +346,12 @@ function render() {
   prev.disabled = cur === 0;
   next.disabled = cur === STEPS.length - 1;
   list.querySelectorAll('.step').forEach(el =>
-    el.addEventListener('click', () => { cur = +el.dataset.i; render(); })
+    el.addEventListener('click', () => { cur = +el.dataset.i; render(true); })
   );
-  list.querySelector('.active')?.scrollIntoView({ block:'nearest', behavior:'smooth' });
+  if (scroll) list.querySelector('.active')?.scrollIntoView({ block:'nearest', behavior:'smooth' });
 }
 
-prev.addEventListener('click', () => { if (cur > 0) { cur--; render(); } });
-next.addEventListener('click', () => { if (cur < STEPS.length - 1) { cur++; render(); } });
+prev.addEventListener('click', () => { if (cur > 0) { cur--; render(true); } });
+next.addEventListener('click', () => { if (cur < STEPS.length - 1) { cur++; render(true); } });
 render();
 </script>
