@@ -1,0 +1,16 @@
+customer_id,application_date,age,gender,employment_status,annual_income,loan_amount,loan_term_months,interest_rate_annual,credit_score,num_open_accounts,delinquency_12m,previous_defaults,loan_purpose,loan_to_income_ratio,estimated_monthly_payment
+CUST2000,07/07/2026,45,F,Employed,132067,5161,60,7.76,671,3,0,0,Car,0.039,104.05
+CUST2001,20/07/2026,24,F,Employed,107121,42065,24,3.7,713,7,0,0,Debt Consolidation,0.393,1821.06
+CUST2002,15/07/2026,43,F,Employed,109479,31557,12,6.38,534,1,0,0,Other,0.288,2721.51
+CUST2003,11/07/2026,23,F,Employed,129475,38763,48,13.81,726,4,0,0,Debt Consolidation,0.299,1055.57
+CUST2004,08/07/2026,45,M,Unemployed,59457,37606,48,14.96,600,4,0,0,Debt Consolidation,0.632,1045.84
+CUST2005,21/07/2026,51,F,Unemployed,106557,16534,48,12.29,630,5,0,0,Car,0.155,437.76
+CUST2006,07/07/2026,59,F,Self-Employed,117189,34127,60,16.93,756,7,1,0,Debt Consolidation,0.291,846.86
+CUST2007,19/07/2026,23,M,Employed,149109,45397,12,12.94,504,7,0,0,Home Improvement,0.304,4053.46
+CUST2008,23/07/2026,42,F,Employed,118953,30851,60,16.77,717,11,0,0,Home Improvement,0.259,762.92
+CUST2009,11/07/2026,54,M,Employed,92995,6016,60,15.83,754,4,0,0,Medical,0.065,145.75
+CUST2010,11/07/2026,33,F,Employed,80757,29253,12,10.02,782,7,2,0,Other,0.362,2572.08
+CUST2011,24/07/2026,43,M,Employed,49692,29276,12,4.88,706,11,0,0,Debt Consolidation,0.589,2504.63
+CUST2012,21/07/2026,46,F,Employed,85758,28247,12,8.88,514,3,0,0,Debt Consolidation,0.329,2468.67
+CUST2013,04/07/2026,48,F,Employed,112409,29300,12,13.2,845,6,0,0,Car,0.261,2619.75
+CUST2014,08/07/2026,63,M,Unemployed,111211,13529,48,13.16,541,2,0,0,Home Improvement,0.122,364.02
