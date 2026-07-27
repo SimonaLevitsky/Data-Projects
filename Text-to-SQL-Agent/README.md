@@ -17,10 +17,17 @@ Unlike standard conversational AI, this agent does not rely on its internal memo
 * **Database:** SQLite & SQLAlchemy
 * **Data Manipulation:** Python & Pandas
   
+## Live Demo
+🚀 [Launch the app](https://data-projects-xecxcrh7wwkkgdrxxjh7zq.streamlit.app/)
+
+## Architecture
+An interactive architecture guide covering the full system design, component responsibilities, and a step-by-step query trace is available here:
+📐 [View Architecture Guide](https://htmlpreview.github.io/?https://github.com/SimonaLevitsky/Data-Projects/blob/main/Text-to-SQL-Agent/architecture/arch-guide.html)
+
 ## How to Run Locally
 1. Clone the repository: `git clone https://github.com/SimonaLevitsky/Data-Projects.git`
 2. Navigate to the specific project folder: `cd Data-Projects/Text-to-SQL-Agent`
-3. Install the required dependencies: `pip install -r requirements.txt`
+3. Install the required dependencies: `python -m pip install -r requirements.txt`
 4. Add your OpenAI API key securely to your environment variables.
 5. Run the Streamlit application: `python -m streamlit run app.py`
 

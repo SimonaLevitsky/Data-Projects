@@ -1,0 +1,357 @@
+<title>Text-to-SQL Architecture Guide</title>
+<style>
+  :root {
+    --bg: #0A0D1A; --surf: #131729; --card: #1A1F35; --border: #252B47;
+    --accent: #00CFFF; --accent-d: rgba(0,207,255,.10);
+    --purple: #9D7FFF; --purple-d: rgba(157,127,255,.10);
+    --green: #3DDBA8; --green-d: rgba(61,219,168,.10);
+    --orange: #FF9950; --orange-d: rgba(255,153,80,.10);
+    --text: #D8E0F0; --text2: #7F8BAA; --text3: #343B5A;
+    --sans: system-ui,-apple-system,'Segoe UI',sans-serif;
+    --mono: 'Cascadia Code','JetBrains Mono','Fira Code','Courier New',monospace;
+  }
+  @media (prefers-color-scheme: light) { :root {
+    --bg: #EDF0FF; --surf: #FFF; --card: #F3F6FF; --border: #D0D6EE;
+    --accent: #006FAD; --accent-d: rgba(0,111,173,.07);
+    --purple: #5830BE; --purple-d: rgba(88,48,190,.07);
+    --green: #0A8C68; --green-d: rgba(10,140,104,.07);
+    --orange: #B55A10; --orange-d: rgba(181,90,16,.07);
+    --text: #0F1428; --text2: #455070; --text3: #A0A8C8;
+  }}
+  :root[data-theme="dark"]  { --bg:#0A0D1A;--surf:#131729;--card:#1A1F35;--border:#252B47;--accent:#00CFFF;--accent-d:rgba(0,207,255,.10);--purple:#9D7FFF;--purple-d:rgba(157,127,255,.10);--green:#3DDBA8;--green-d:rgba(61,219,168,.10);--orange:#FF9950;--orange-d:rgba(255,153,80,.10);--text:#D8E0F0;--text2:#7F8BAA;--text3:#343B5A; }
+  :root[data-theme="light"] { --bg:#EDF0FF;--surf:#FFF;--card:#F3F6FF;--border:#D0D6EE;--accent:#006FAD;--accent-d:rgba(0,111,173,.07);--purple:#5830BE;--purple-d:rgba(88,48,190,.07);--green:#0A8C68;--green-d:rgba(10,140,104,.07);--orange:#B55A10;--orange-d:rgba(181,90,16,.07);--text:#0F1428;--text2:#455070;--text3:#A0A8C8; }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { font-size: 16px; }
+  body { font-family: var(--sans); background: var(--bg); color: var(--text); line-height: 1.7; }
+
+  .page { max-width: 920px; margin: 0 auto; padding: 0 1.5rem 6rem; }
+
+  .hero { padding: 4rem 0 3.5rem; border-bottom: 1px solid var(--border); margin-bottom: 3.5rem; }
+  .eyebrow { font-family: var(--mono); font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); display: flex; align-items: center; gap: .6rem; margin-bottom: .9rem; }
+  .eyebrow::before { content:''; display:inline-block; width:1.75rem; height:1px; background:var(--accent); }
+  .hero h1 { font-size: clamp(1.75rem,4vw,2.6rem); font-weight: 700; line-height: 1.2; text-wrap: balance; margin-bottom: 1rem; }
+  .hero p { font-size: 1.05rem; color: var(--text2); max-width: 580px; }
+
+  .section { margin-bottom: 4rem; }
+  .section-title { font-size: 1.25rem; font-weight: 700; margin-bottom: .4rem; }
+  .section-sub { font-size: .9rem; color: var(--text2); margin-bottom: 1.5rem; }
+
+  .diagram-wrap { background: var(--surf); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem 1rem; overflow-x: auto; }
+  .diagram-wrap svg { display: block; width: 100%; min-width: 580px; max-width: 780px; margin: 0 auto; }
+
+  @keyframes dash-flow { from { stroke-dashoffset: 24; } to { stroke-dashoffset: 0; } }
+  .flow { stroke-dasharray: 5 5; animation: dash-flow 1s linear infinite; }
+  .flow-slow { stroke-dasharray: 5 5; animation: dash-flow 1.4s linear infinite; }
+
+  .trace-card { background: var(--surf); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .trace-q { padding: .9rem 1.25rem; background: var(--card); border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: .88rem; display: flex; gap: .75rem; align-items: baseline; flex-wrap: wrap; }
+  .trace-q .ql { color: var(--orange); font-weight: 600; flex-shrink: 0; }
+  .trace-q .qt { color: var(--text); }
+  .steps-list { padding: .5rem 0; }
+  .step { display: flex; gap: 1rem; padding: .8rem 1.25rem; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .15s; opacity: .35; }
+  .step:last-child { border-bottom: none; }
+  .step:hover { background: var(--card); }
+  .step.active { opacity: 1; background: var(--card); }
+  .step.done { opacity: .55; }
+  .step-n { font-family: var(--mono); font-size: .72rem; color: var(--text3); width: 1.6rem; flex-shrink: 0; padding-top: .2rem; font-variant-numeric: tabular-nums; }
+  .step.active .step-n { color: var(--accent); }
+  .step.done  .step-n { color: var(--text2); }
+  .step-b { flex: 1; min-width: 0; }
+  .step-layer { font-family: var(--mono); font-size: .68rem; letter-spacing: .09em; text-transform: uppercase; margin-bottom: .25rem; }
+  .step-desc { font-size: .9rem; color: var(--text); margin-bottom: .5rem; }
+  .step:not(.active) .step-desc { color: var(--text2); }
+  .step-code { font-family: var(--mono); font-size: .78rem; background: var(--bg); color: var(--accent); padding: .6rem .9rem; border-left: 2px solid var(--accent); border-radius: 0 4px 4px 0; overflow-x: auto; white-space: pre; display: none; line-height: 1.6; }
+  .step.active .step-code { display: block; }
+  .trace-nav { display: flex; align-items: center; justify-content: space-between; padding: .9rem 1.25rem; border-top: 1px solid var(--border); background: var(--card); }
+  .trace-nav button { font-family: var(--sans); font-size: .83rem; padding: .4rem .95rem; border: 1px solid var(--border); border-radius: 4px; background: var(--surf); color: var(--text); cursor: pointer; transition: border-color .15s, color .15s; }
+  .trace-nav button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .trace-nav button:disabled { opacity: .3; cursor: not-allowed; }
+  .step-ctr { font-family: var(--mono); font-size: .78rem; color: var(--text2); }
+
+  .comp-grid { display: grid; grid-template-columns: 1fr; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  @media (min-width: 640px) { .comp-grid { grid-template-columns: 1fr 1fr; } }
+  .comp { background: var(--surf); padding: 1.5rem; display: flex; flex-direction: column; gap: .9rem; }
+  .comp-wide { grid-column: 1 / -1; flex-direction: row; gap: 1.25rem; flex-wrap: wrap; }
+  .comp-icon { width: 2.8rem; height: 2.8rem; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; flex-shrink: 0; }
+  .comp-meta { display: flex; flex-direction: column; gap: .15rem; }
+  .comp-name { font-weight: 700; font-size: 1rem; }
+  .comp-role { font-family: var(--mono); font-size: .7rem; letter-spacing: .07em; text-transform: uppercase; }
+  .comp-desc { font-size: .875rem; color: var(--text2); }
+  .comp-wide .comp-desc { max-width: 540px; }
+  ul.rlist { list-style: none; display: flex; flex-direction: column; gap: .3rem; }
+  ul.rlist li { font-size: .83rem; color: var(--text2); padding-left: 1.1rem; position: relative; }
+  ul.rlist li::before { content: '→'; position: absolute; left: 0; color: var(--text3); }
+  .comp-wide ul.rlist { columns: 2; gap: .5rem; }
+  @media (max-width: 600px) { .comp-wide ul.rlist { columns: 1; } }
+
+  code { font-family: var(--mono); font-size: .83em; background: var(--card); border: 1px solid var(--border); padding: .1em .35em; border-radius: 3px; color: var(--accent); }
+
+  .c-orange{color:var(--orange)} .c-accent{color:var(--accent)} .c-purple{color:var(--purple)} .c-green{color:var(--green)} .c-muted{color:var(--text2)}
+  .bg-orange{background:var(--orange-d)} .bg-accent{background:var(--accent-d)} .bg-purple{background:var(--purple-d)} .bg-green{background:var(--green-d)} .bg-muted{background:var(--card)}
+
+  @media (prefers-reduced-motion: reduce) { .flow, .flow-slow { animation: none; stroke-dasharray: none; } }
+</style>
+
+<div class="page">
+
+  <header class="hero">
+    <div class="eyebrow">Architecture Guide</div>
+    <h1>How Your AI SQL Agent Works</h1>
+    <p>A complete map of every service in the stack — what each piece is responsible for, how they connect, and exactly what happens when a question enters the system.</p>
+  </header>
+
+  <section class="section">
+    <div class="section-title">System Architecture</div>
+    <div class="section-sub">Four layers connected by LangChain acting as the central coordinator.</div>
+    <div class="diagram-wrap">
+      <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" fill="none" aria-label="System architecture diagram">
+        <defs>
+          <filter id="glow-b" x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+          </filter>
+        </defs>
+        <rect x="5" y="5" width="750" height="310" rx="10" stroke="var(--text3)" stroke-width="1" stroke-dasharray="5 4" opacity=".6"/>
+        <text x="378" y="22" text-anchor="middle" font-size="9.5" font-family="monospace" fill="var(--text3)" letter-spacing="2.5">STREAMLIT CLOUD — PRODUCTION ENVIRONMENT</text>
+        <circle cx="52" cy="162" r="26" fill="var(--orange-d)" stroke="var(--orange)" stroke-width="1.5"/>
+        <text x="52" y="157" text-anchor="middle" font-size="17">👤</text>
+        <text x="52" y="203" text-anchor="middle" font-size="8.5" font-family="monospace" fill="var(--orange)" letter-spacing="1">USER</text>
+        <rect x="108" y="122" width="128" height="80" rx="6" fill="var(--orange-d)" stroke="var(--orange)" stroke-width="1.5"/>
+        <text x="172" y="154" text-anchor="middle" font-size="17">🖥️</text>
+        <text x="172" y="172" text-anchor="middle" font-size="9.5" font-family="monospace" fill="var(--text)" font-weight="600" letter-spacing=".5">Streamlit</text>
+        <text x="172" y="186" text-anchor="middle" font-size="8" font-family="monospace" fill="var(--text2)">Chat UI · app.py</text>
+        <rect x="312" y="122" width="128" height="80" rx="6" fill="var(--accent-d)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="376" y="154" text-anchor="middle" font-size="17">🔗</text>
+        <text x="376" y="172" text-anchor="middle" font-size="9.5" font-family="monospace" fill="var(--text)" font-weight="600" letter-spacing=".5">LangChain</text>
+        <text x="376" y="186" text-anchor="middle" font-size="8" font-family="monospace" fill="var(--text2)">SQL Agent · Orchestrator</text>
+        <rect x="546" y="38" width="128" height="80" rx="6" fill="var(--purple-d)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="610" y="70" text-anchor="middle" font-size="17">🤖</text>
+        <text x="610" y="88" text-anchor="middle" font-size="9.5" font-family="monospace" fill="var(--text)" font-weight="600" letter-spacing=".5">OpenAI</text>
+        <text x="610" y="102" text-anchor="middle" font-size="8" font-family="monospace" fill="var(--text2)">GPT-4o-mini · LLM</text>
+        <rect x="546" y="202" width="128" height="80" rx="6" fill="var(--green-d)" stroke="var(--green)" stroke-width="1.5"/>
+        <text x="610" y="234" text-anchor="middle" font-size="17">🗄️</text>
+        <text x="610" y="252" text-anchor="middle" font-size="9.5" font-family="monospace" fill="var(--text)" font-weight="600" letter-spacing=".5">SQLite</text>
+        <text x="610" y="266" text-anchor="middle" font-size="8" font-family="monospace" fill="var(--text2)">credit_risk.db</text>
+        <line x1="78" y1="156" x2="104" y2="156" stroke="var(--orange)" stroke-width="1.5" opacity=".35"/>
+        <line x1="78" y1="156" x2="104" y2="156" stroke="var(--orange)" stroke-width="1.5" class="flow"/>
+        <polygon points="104,151 104,161 112,156" fill="var(--orange)"/>
+        <line x1="104" y1="170" x2="78" y2="170" stroke="var(--orange)" stroke-width="1" opacity=".2"/>
+        <polygon points="78,165 78,175 70,170" fill="var(--orange)" opacity=".25"/>
+        <text x="88" y="148" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--orange)" opacity=".7">question</text>
+        <text x="88" y="182" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--orange)" opacity=".4">answer</text>
+        <line x1="236" y1="156" x2="308" y2="156" stroke="var(--accent)" stroke-width="1.5" opacity=".35"/>
+        <line x1="236" y1="156" x2="308" y2="156" stroke="var(--accent)" stroke-width="1.5" class="flow" style="animation-delay:.4s"/>
+        <polygon points="308,151 308,161 316,156" fill="var(--accent)"/>
+        <line x1="308" y1="170" x2="236" y2="170" stroke="var(--accent)" stroke-width="1" opacity=".2"/>
+        <polygon points="236,165 236,175 228,170" fill="var(--accent)" opacity=".25"/>
+        <text x="272" y="148" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--accent)" opacity=".7">question</text>
+        <text x="272" y="182" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--accent)" opacity=".4">answer</text>
+        <line x1="437" y1="140" x2="543" y2="88" stroke="var(--purple)" stroke-width="1.5" opacity=".35"/>
+        <line x1="437" y1="140" x2="543" y2="88" stroke="var(--purple)" stroke-width="1.5" class="flow-slow" style="animation-delay:.2s"/>
+        <polygon points="537,82 548,84 543,95" fill="var(--purple)"/>
+        <line x1="543" y1="100" x2="440" y2="152" stroke="var(--purple)" stroke-width="1" opacity=".2"/>
+        <polygon points="441,145 435,155 446,157" fill="var(--purple)" opacity=".25"/>
+        <text x="483" y="100" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--purple)" opacity=".7" transform="rotate(-25 483 100)">prompt + schema</text>
+        <text x="500" y="147" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--purple)" opacity=".4" transform="rotate(-25 500 147)">SQL query</text>
+        <line x1="437" y1="182" x2="543" y2="234" stroke="var(--green)" stroke-width="1.5" opacity=".35"/>
+        <line x1="437" y1="182" x2="543" y2="234" stroke="var(--green)" stroke-width="1.5" class="flow-slow" style="animation-delay:.8s"/>
+        <polygon points="537,228 543,239 548,228" fill="var(--green)"/>
+        <line x1="543" y1="222" x2="440" y2="172" stroke="var(--green)" stroke-width="1" opacity=".2"/>
+        <polygon points="440,165 435,175 447,175" fill="var(--green)" opacity=".25"/>
+        <text x="483" y="195" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--green)" opacity=".7" transform="rotate(25 483 195)">SQL execution</text>
+        <text x="501" y="223" text-anchor="middle" font-size="7" font-family="monospace" fill="var(--green)" opacity=".4" transform="rotate(25 501 223)">raw results</text>
+        <g transform="translate(18,289)">
+          <rect x="0" y="-1" width="10" height="10" rx="2" fill="var(--orange-d)" stroke="var(--orange)" stroke-width="1"/>
+          <text x="14" y="8" font-size="8" font-family="monospace" fill="var(--text2)">UI</text>
+          <rect x="50" y="-1" width="10" height="10" rx="2" fill="var(--accent-d)" stroke="var(--accent)" stroke-width="1"/>
+          <text x="64" y="8" font-size="8" font-family="monospace" fill="var(--text2)">Orchestration</text>
+          <rect x="148" y="-1" width="10" height="10" rx="2" fill="var(--purple-d)" stroke="var(--purple)" stroke-width="1"/>
+          <text x="162" y="8" font-size="8" font-family="monospace" fill="var(--text2)">LLM</text>
+          <rect x="196" y="-1" width="10" height="10" rx="2" fill="var(--green-d)" stroke="var(--green)" stroke-width="1"/>
+          <text x="210" y="8" font-size="8" font-family="monospace" fill="var(--text2)">Database</text>
+          <line x1="264" y1="4" x2="284" y2="4" stroke="var(--text3)" stroke-width="1.5" stroke-dasharray="3 3"/>
+          <text x="288" y="8" font-size="8" font-family="monospace" fill="var(--text2)">Animated = data flowing</text>
+        </g>
+      </svg>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-title">Component Responsibilities</div>
+    <div class="section-sub">What each piece owns, and what it hands off.</div>
+    <div class="comp-grid">
+      <div class="comp">
+        <div style="display:flex;gap:.75rem;align-items:center">
+          <div class="comp-icon bg-orange c-orange">🖥️</div>
+          <div class="comp-meta"><div class="comp-name">Streamlit</div><div class="comp-role c-orange">UI Layer</div></div>
+        </div>
+        <p class="comp-desc">The web framework that builds the chat interface. It handles all rendering and state — no HTML or CSS needed. Your <code>app.py</code> is almost entirely Streamlit calls.</p>
+        <ul class="rlist">
+          <li>Renders the chat history from <code>st.session_state</code></li>
+          <li>Captures user input via <code>st.chat_input()</code></li>
+          <li>Shows a spinner while the agent is thinking</li>
+          <li>Reads the API key from <code>secrets.toml</code> or env</li>
+          <li>Passes the question to LangChain, displays the answer</li>
+        </ul>
+      </div>
+      <div class="comp">
+        <div style="display:flex;gap:.75rem;align-items:center">
+          <div class="comp-icon bg-accent c-accent">🔗</div>
+          <div class="comp-meta"><div class="comp-name">LangChain</div><div class="comp-role c-accent">Orchestration Layer</div></div>
+        </div>
+        <p class="comp-desc">The coordinator. <code>create_sql_agent</code> knows the DB schema and decides when to ask OpenAI for SQL and when to execute it. It runs the agentic loop so you don't have to.</p>
+        <ul class="rlist">
+          <li>Inspects the SQLite schema on startup</li>
+          <li>Builds prompts: schema + user question → OpenAI</li>
+          <li>Executes the generated SQL against SQLite</li>
+          <li>Sends results back to OpenAI for formatting</li>
+          <li>Returns the final answer to Streamlit</li>
+        </ul>
+      </div>
+      <div class="comp">
+        <div style="display:flex;gap:.75rem;align-items:center">
+          <div class="comp-icon bg-purple c-purple">🤖</div>
+          <div class="comp-meta"><div class="comp-name">OpenAI GPT-4o-mini</div><div class="comp-role c-purple">Intelligence Layer</div></div>
+        </div>
+        <p class="comp-desc">The language model that understands Hebrew/English and generates SQL. It's called <strong>twice</strong> per question: once to produce the query, once to turn raw results into a readable answer.</p>
+        <ul class="rlist">
+          <li>Input 1: schema + question → Output: SQL query</li>
+          <li>Input 2: SQL results + context → Output: human answer</li>
+          <li><code>temperature=0</code> makes SQL generation deterministic</li>
+          <li>Runs remotely — no local compute, billed per token</li>
+        </ul>
+      </div>
+      <div class="comp">
+        <div style="display:flex;gap:.75rem;align-items:center">
+          <div class="comp-icon bg-green c-green">🗄️</div>
+          <div class="comp-meta"><div class="comp-name">SQLite + SQLAlchemy</div><div class="comp-role c-green">Data Layer</div></div>
+        </div>
+        <p class="comp-desc">A serverless, file-based database. The entire DB is <code>credit_risk.db</code> — one file, no installation. SQLAlchemy is the Python connector that LangChain uses to talk to it.</p>
+        <ul class="rlist">
+          <li>Stores the <code>loans</code> table (100 mock records)</li>
+          <li>Executes SQL sent by LangChain</li>
+          <li>Returns raw result sets</li>
+          <li>Exposes schema metadata for LangChain to describe to OpenAI</li>
+        </ul>
+      </div>
+      <div class="comp comp-wide">
+        <div style="display:flex;gap:.75rem;align-items:center;flex-shrink:0">
+          <div class="comp-icon bg-muted c-muted">☁️</div>
+          <div class="comp-meta"><div class="comp-name">Streamlit Cloud</div><div class="comp-role c-muted">Hosting &amp; Deployment</div></div>
+        </div>
+        <div>
+          <p class="comp-desc">The free hosting platform that runs the app publicly. It watches your GitHub repo and redeploys automatically on every push to <code>main</code>. Secrets never touch the filesystem — they live in its dashboard.</p>
+          <ul class="rlist" style="margin-top:.75rem">
+            <li>Watches GitHub → auto-redeploys on push to <code>main</code></li>
+            <li>Runs <code>pip install -r requirements.txt</code> on each deploy</li>
+            <li>Injects <code>OPENAI_API_KEY</code> from the Secrets dashboard into <code>st.secrets</code></li>
+            <li>Provides a public URL — no servers to manage</li>
+            <li>Free tier handles small portfolio projects without any cost</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-title">Follow a Query Through the System</div>
+    <div class="section-sub">Click through each step or use the buttons to trace what happens when a question enters the system.</div>
+    <div class="trace-card">
+      <div class="trace-q">
+        <span class="ql">Question:</span>
+        <span class="qt">"מה סכום ההלוואה הממוצע בתיק?"</span>
+      </div>
+      <div class="steps-list" id="steps-list"></div>
+      <div class="trace-nav">
+        <button id="prev-btn" disabled>← Previous</button>
+        <span class="step-ctr" id="step-ctr">Step 1 of 6</span>
+        <button id="next-btn">Next →</button>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+const STEPS = [
+  {
+    n:'01', layer:'UI Layer — Streamlit', cls:'c-orange',
+    desc:'The user types a question into the Streamlit chat input. Streamlit appends it to the session message history and re-renders the chat bubble.',
+    code:`user_query = st.chat_input("לדוגמה: מה סכום ההלוואה הממוצע?")
+# captured value: "מה סכום ההלוואה הממוצע בתיק?"`
+  },
+  {
+    n:'02', layer:'Orchestration — LangChain', cls:'c-accent',
+    desc:'LangChain\'s SQL Agent reads the SQLite schema — table names, column names, types. This gives the model the context it needs to write correct SQL.',
+    code:`-- Schema inspected by LangChain:
+CREATE TABLE loans (
+  client_id    INTEGER,
+  age          INTEGER,
+  loan_amount  REAL,
+  credit_score INTEGER,
+  default_status INTEGER
+)`
+  },
+  {
+    n:'03', layer:'Intelligence — OpenAI GPT-4o-mini', cls:'c-purple',
+    desc:'LangChain builds a prompt containing the schema and the user\'s question, then sends it to OpenAI. The model reasons about which table and column to use and generates SQL.',
+    code:`-- OpenAI generates:
+SELECT AVG(loan_amount) AS avg_loan_amount
+FROM loans`
+  },
+  {
+    n:'04', layer:'Data Layer — SQLite', cls:'c-green',
+    desc:'LangChain executes the generated SQL against credit_risk.db using SQLAlchemy. SQLite runs the query and returns the raw numeric result.',
+    code:`-- SQLite executes and returns:
+[(245312.50,)]`
+  },
+  {
+    n:'05', layer:'Intelligence — OpenAI GPT-4o-mini', cls:'c-purple',
+    desc:'LangChain sends the raw result back to OpenAI with context, asking it to format a natural language answer. This is the second OpenAI call per question.',
+    code:`-- OpenAI formats the result into:
+"The average loan amount in the portfolio
+ is $245,312.50 across all 100 clients."`
+  },
+  {
+    n:'06', layer:'UI Layer — Streamlit', cls:'c-orange',
+    desc:'LangChain returns the answer to Streamlit. It renders it in the assistant chat bubble and saves it to session_state so the conversation persists on re-render.',
+    code:`st.markdown(answer)
+st.session_state.messages.append({
+    "role": "assistant",
+    "content": answer
+})`
+  }
+];
+
+let cur = 0;
+const list = document.getElementById('steps-list');
+const ctr  = document.getElementById('step-ctr');
+const prev = document.getElementById('prev-btn');
+const next = document.getElementById('next-btn');
+
+function render() {
+  list.innerHTML = STEPS.map((s, i) => {
+    const cls = i === cur ? 'step active' : i < cur ? 'step done' : 'step';
+    return `<div class="${cls}" data-i="${i}">
+      <div class="step-n">${s.n}</div>
+      <div class="step-b">
+        <div class="step-layer ${s.cls}">${s.layer}</div>
+        <div class="step-desc">${s.desc}</div>
+        <pre class="step-code">${s.code}</pre>
+      </div>
+    </div>`;
+  }).join('');
+  ctr.textContent = `Step ${cur + 1} of ${STEPS.length}`;
+  prev.disabled = cur === 0;
+  next.disabled = cur === STEPS.length - 1;
+  list.querySelectorAll('.step').forEach(el =>
+    el.addEventListener('click', () => { cur = +el.dataset.i; render(); })
+  );
+  list.querySelector('.active')?.scrollIntoView({ block:'nearest', behavior:'smooth' });
+}
+
+prev.addEventListener('click', () => { if (cur > 0) { cur--; render(); } });
+next.addEventListener('click', () => { if (cur < STEPS.length - 1) { cur++; render(); } });
+render();
+</script>

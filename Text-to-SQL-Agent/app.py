@@ -13,6 +13,23 @@ st.set_page_config(
     layout="centered"
 )
 
+st.markdown("""
+    <style>
+    .main .block-container { direction: rtl; }
+    .stChatMessage p, .stMarkdown p {
+        unicode-bidi: plaintext;
+        text-align: start;
+    }
+    .stChatInput textarea {
+        direction: rtl;
+        unicode-bidi: plaintext;
+        text-align: start;
+    }
+    h1, h2, h3 { direction: rtl; text-align: right; }
+    .stAlert { direction: rtl; text-align: right; }
+    </style>
+""", unsafe_allow_html=True)
+
 st.title("🤖 AI Credit Risk Assistant")
 st.markdown("שאלו שאלות על תיק האשראי בשפה טבעית, והסוכן יתרגם אותן לשאילתות SQL ויציג את התשובות.")
 
