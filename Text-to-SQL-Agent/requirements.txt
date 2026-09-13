@@ -4,3 +4,4 @@ langchain-openai
 langchain-community
 sqlalchemy
 pandas
+langgraph
