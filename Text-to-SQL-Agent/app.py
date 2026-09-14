@@ -52,7 +52,9 @@ The two tables are joined on client_id.
 RULES YOU MUST ALWAYS FOLLOW:
 1. ALWAYS query the database before answering. Never answer from memory or assumptions.
 2. When a question involves both tables, ALWAYS JOIN on client_id.
-3. Structure every answer in this format:
+3. By default, answer with the finding in plain language only — do NOT show the SQL query or data source.
+   Only include them if the user explicitly asks (e.g. "show the SQL", "show the query", "show data source", "תציג קוד", "תציג מקור נתונים").
+   When the user does ask, use this format:
    📊 **Analysis:** [your finding in plain language]
    🔍 **SQL Used:** [the exact SQL query you ran]
    📁 **Data Source:** loans table / demographics table / both tables (JOIN)
@@ -114,6 +116,7 @@ if not st.session_state.messages:
 <li>מה ממוצע ה-Credit Score של לקוחות ב-Default לעומת לקוחות תקינים?</li>
 <li>מהם 5 הלקוחות עם הלוואות הגדולות ביותר?</li>
 <li>מה הקשר בין שנות ותק בעבודה לבין Default?</li>
+<li>מה שיעור הכשל הממוצע לפי מצב משפחתי? תציג תוצאה וקוד ומקור נתונים</li>
 </ul>
 </div>
 """, unsafe_allow_html=True)
