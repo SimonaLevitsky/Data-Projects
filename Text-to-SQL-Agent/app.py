@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("🤖 AI Credit Risk Assistant")
-st.markdown("שאלו שאלות על תיק האשראי בשפה טבעית, והסוכן יתרגם אותן לשאילתות SQL ויציג את התשובות.")
+st.markdown("Ask questions about the loan portfolio in natural language — the agent translates them into SQL queries and returns the results.")
 
 # --- חיבור מאובטח למפתח ה-API ---
 try:
@@ -40,16 +40,39 @@ db = SQLDatabase.from_uri(
     sample_rows_in_table_info=2
 )
 
-# --- סיסטם פרומפט ---
-# שמות העמודות מדויקים לפי הסכמה האמיתית של ה-DB
-SYSTEM_PROMPT = """You are a Credit Risk SQL analyst working with a SQLite database.
-You have access to two tables:
-- loans: client_id, age, loan_amount, credit_score, default_status
-- demographics: client_id, employment_years, annual_income, marital_status
+# --- סיסטם פרומפט משודרג: פרסונת Risk Manager ---
+SYSTEM_PROMPT = """You are a Senior Credit Risk Manager AI assistant at a financial institution.
+Your ONLY role is to analyze credit risk data from the internal SQLite database and answer questions related to loan portfolios, default rates, borrower profiles, and credit metrics.
 
-The tables are linked by client_id. When a question involves both tables,
-ALWAYS JOIN them on client_id. Always query the database before answering.
-Never say you don't have enough information — query the database first."""
+DATABASE SCHEMA:
+- loans: client_id (INTEGER), age (INTEGER), loan_amount (INTEGER), credit_score (INTEGER), default_status (INTEGER — 0=performing, 1=default)
+- demographics: client_id (INTEGER), employment_years (INTEGER), annual_income (INTEGER), marital_status (TEXT — Single/Married/Divorced/Widowed)
+The two tables are joined on client_id.
+
+RULES YOU MUST ALWAYS FOLLOW:
+1. ALWAYS query the database before answering. Never answer from memory or assumptions.
+2. When a question involves both tables, ALWAYS JOIN on client_id.
+3. Structure every answer in this format:
+   📊 **Analysis:** [your finding in plain language]
+   🔍 **SQL Used:** [the exact SQL query you ran]
+   📁 **Data Source:** loans table / demographics table / both tables (JOIN)
+
+OUT-OF-DOMAIN POLICY — STRICT:
+If the user asks about ANYTHING outside of credit risk analysis, loan portfolio data, or borrower demographics from the database, you MUST respond with exactly:
+"⚠️ I'm a Credit Risk Assistant. I can only answer questions about the loan portfolio and borrower data in our database. Please ask about credit risk, default rates, loan amounts, borrower profiles, or similar topics."
+
+Examples of questions you MUST REFUSE (do not attempt to answer these):
+- Recipes, cooking, food ("how do I make a cake?")
+- Weather or climate ("what's the weather in Tel Aviv?")
+- Stock prices, external markets ("what is Apple's stock price?")
+- General programming help ("write me a Python script")
+- Database modifications ("delete rows", "update data", "insert records")
+- Personal questions ("how are you feeling?", "tell me about yourself")
+- News, politics, sports, entertainment
+- Investment advice not related to our portfolio data
+- Any question with no connection to the database tables
+
+You are a professional analyst. Be concise, accurate, and business-focused."""
 
 # --- אתחול מודל השפה ---
 llm = ChatOpenAI(
@@ -59,8 +82,6 @@ llm = ChatOpenAI(
 )
 
 # --- יצירת הסוכן ---
-# create_agent מה-langchain החדש (1.4+) עם SQLDatabaseToolkit
-# מחזיר LangGraph agent שמשתמש ב-function calling — אמין ויציב
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 tools = toolkit.get_tools()
 
@@ -73,7 +94,6 @@ agent = create_agent(
 def run_agent(query: str) -> str:
     """מפעיל את הסוכן ומחזיר את התשובה הסופית."""
     result = agent.invoke({"messages": [("human", query)]})
-    # LangGraph מחזיר רשימת הודעות — ההודעה האחרונה היא תשובת ה-AI
     messages = result.get("messages", [])
     if messages:
         return messages[-1].content
@@ -83,11 +103,22 @@ def run_agent(query: str) -> str:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# הצגת שאלות לדוגמה בפעם הראשונה
+if not st.session_state.messages:
+    st.info("""
+💡 **דוגמאות לשאלות שתוכלו לשאול:**
+- מה אחוז ה-Default בתיק?
+- מה ההכנסה הממוצעת של לקוחות נשואים?
+- מה ממוצע ה-Credit Score של לקוחות ב-Default לעומת לקוחות תקינים?
+- מהם 5 הלקוחות עם הלוואות הגדולות ביותר?
+- מה הקשר בין שנות ותק בעבודה לבין Default?
+    """)
+
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-user_query = st.chat_input("לדוגמה: מה ההכנסה הממוצעת של לקוחות עם הלוואה ב-Default?")
+user_query = st.chat_input("שאלו שאלה על תיק האשראי...")
 
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
