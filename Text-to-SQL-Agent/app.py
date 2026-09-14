@@ -105,14 +105,18 @@ if "messages" not in st.session_state:
 
 # הצגת שאלות לדוגמה בפעם הראשונה
 if not st.session_state.messages:
-    st.info("""
-💡 **דוגמאות לשאלות שתוכלו לשאול:**
-- מה אחוז ה-Default בתיק?
-- מה ההכנסה הממוצעת של לקוחות נשואים?
-- מה ממוצע ה-Credit Score של לקוחות ב-Default לעומת לקוחות תקינים?
-- מהם 5 הלקוחות עם הלוואות הגדולות ביותר?
-- מה הקשר בין שנות ותק בעבודה לבין Default?
-    """)
+    st.markdown("""
+<div style="direction: rtl; text-align: right; background-color: #e8f4fd; border-left: 4px solid #1f77b4; border-radius: 6px; padding: 16px; margin-bottom: 16px;">
+<strong>💡 דוגמאות לשאלות שתוכלו לשאול:</strong>
+<ul style="margin-top: 8px; margin-bottom: 0;">
+<li>מה אחוז ה-Default בתיק?</li>
+<li>מה ההכנסה הממוצעת של לקוחות נשואים?</li>
+<li>מה ממוצע ה-Credit Score של לקוחות ב-Default לעומת לקוחות תקינים?</li>
+<li>מהם 5 הלקוחות עם הלוואות הגדולות ביותר?</li>
+<li>מה הקשר בין שנות ותק בעבודה לבין Default?</li>
+</ul>
+</div>
+""", unsafe_allow_html=True)
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
