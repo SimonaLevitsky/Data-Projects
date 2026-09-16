@@ -1,4 +1,5 @@
 import os
+import json
 import streamlit as st
 from langchain.agents import create_agent
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
@@ -33,14 +34,13 @@ if not os.path.exists(db_path):
     st.error(f"שגיאה: קובץ מסד הנתונים '{db_path}' לא נמצא.")
     st.stop()
 
-# include_tables מבטיח שה-agent רואה רק את שתי הטבלאות הרלוונטיות
 db = SQLDatabase.from_uri(
     f"sqlite:///{db_path}",
     include_tables=["loans", "demographics"],
     sample_rows_in_table_info=2
 )
 
-# --- סיסטם פרומפט משודרג: פרסונת Risk Manager ---
+# --- סיסטם פרומפט: JSON Structured Output + Confidence Score ---
 SYSTEM_PROMPT = """You are a Senior Credit Risk Manager AI assistant at a financial institution.
 Your ONLY role is to analyze credit risk data from the internal SQLite database and answer questions related to loan portfolios, default rates, borrower profiles, and credit metrics.
 
@@ -49,32 +49,29 @@ DATABASE SCHEMA:
 - demographics: client_id (INTEGER), employment_years (INTEGER), annual_income (INTEGER), marital_status (TEXT — Single/Married/Divorced/Widowed)
 The two tables are joined on client_id.
 
-RULES YOU MUST ALWAYS FOLLOW:
-1. ALWAYS query the database before answering. Never answer from memory or assumptions.
+OUTPUT FORMAT — STRICT:
+You MUST always respond with a valid JSON object and nothing else. No prose before or after. No markdown fences.
+The JSON must contain exactly these three fields:
+
+{
+  "answer": "Your natural language finding, concise and business-focused.",
+  "sql_query": "The exact SQL you executed against the database.",
+  "confidence_score": <integer 0-100>
+}
+
+CONFIDENCE SCORE RULES:
+- 90-100: You ran a clean query, the schema matched perfectly, the result is unambiguous.
+- 70-89: Minor assumptions made (e.g. column interpretation), result is likely correct.
+- 50-69: The question was ambiguous or the data is sparse — answer may be incomplete.
+- 0-49: You could not find a reliable answer. Set answer to a clarification request.
+
+If confidence_score < 70, set "answer" to a clarification question asking the user to rephrase or provide more detail — do NOT guess.
+
+RULES:
+1. ALWAYS query the database before answering. Never answer from memory.
 2. When a question involves both tables, ALWAYS JOIN on client_id.
-3. By default, answer with the finding in plain language only — do NOT show the SQL query or data source.
-   Only include them if the user explicitly asks (e.g. "show the SQL", "show the query", "show data source", "תציג קוד", "תציג מקור נתונים").
-   When the user does ask, use this format:
-   📊 **Analysis:** [your finding in plain language]
-   🔍 **SQL Used:** [the exact SQL query you ran]
-   📁 **Data Source:** loans table / demographics table / both tables (JOIN)
-
-OUT-OF-DOMAIN POLICY — STRICT:
-If the user asks about ANYTHING outside of credit risk analysis, loan portfolio data, or borrower demographics from the database, you MUST respond with exactly:
-"⚠️ I'm a Credit Risk Assistant. I can only answer questions about the loan portfolio and borrower data in our database. Please ask about credit risk, default rates, loan amounts, borrower profiles, or similar topics."
-
-Examples of questions you MUST REFUSE (do not attempt to answer these):
-- Recipes, cooking, food ("how do I make a cake?")
-- Weather or climate ("what's the weather in Tel Aviv?")
-- Stock prices, external markets ("what is Apple's stock price?")
-- General programming help ("write me a Python script")
-- Database modifications ("delete rows", "update data", "insert records")
-- Personal questions ("how are you feeling?", "tell me about yourself")
-- News, politics, sports, entertainment
-- Investment advice not related to our portfolio data
-- Any question with no connection to the database tables
-
-You are a professional analyst. Be concise, accurate, and business-focused."""
+3. For out-of-domain questions (recipes, weather, stocks, coding help, personal questions, database modifications), return:
+   {"answer": "⚠️ I'm a Credit Risk Assistant. I can only answer questions about the loan portfolio and borrower data in our database.", "sql_query": "", "confidence_score": 0}"""
 
 # --- אתחול מודל השפה ---
 llm = ChatOpenAI(
@@ -93,19 +90,71 @@ agent = create_agent(
     system_prompt=SYSTEM_PROMPT,
 )
 
-def run_agent(query: str) -> str:
-    """מפעיל את הסוכן ומחזיר את התשובה הסופית."""
+# --- Confidence badge helper ---
+def confidence_badge(score: int) -> str:
+    if score >= 90:
+        color, label = "#28a745", "High"
+    elif score >= 70:
+        color, label = "#ffc107", "Medium"
+    elif score >= 50:
+        color, label = "#fd7e14", "Low"
+    else:
+        color, label = "#dc3545", "Very Low"
+    return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:12px;font-size:0.8em;font-weight:600;">{label} confidence ({score}%)</span>'
+
+def run_agent(query: str) -> dict:
+    """מפעיל את הסוכן ומחזיר dict מפורסר."""
     result = agent.invoke({"messages": [("human", query)]})
     messages = result.get("messages", [])
-    if messages:
-        return messages[-1].content
-    return "לא התקבלה תשובה מהסוכן."
+    raw = messages[-1].content if messages else ""
+
+    # נסה לפרסר JSON
+    try:
+        # נקה markdown fences אם יש
+        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, AttributeError):
+        # Fallback: החזר כתשובה רגילה עם confidence נמוך
+        return {
+            "answer": raw or "לא התקבלה תשובה מהסוכן.",
+            "sql_query": "",
+            "confidence_score": 50
+        }
+
+def render_response(data: dict, show_sql: bool = False):
+    """מציג את התשובה המובנית ב-Streamlit."""
+    answer = data.get("answer", "")
+    sql_query = data.get("sql_query", "")
+    confidence = data.get("confidence_score", 0)
+
+    # תשובה ראשית
+    st.markdown(answer)
+
+    # Confidence indicator
+    if confidence > 0:
+        st.markdown(
+            confidence_badge(confidence),
+            unsafe_allow_html=True
+        )
+        st.progress(confidence / 100)
+
+    # SQL — רק אם המשתמש ביקש
+    if show_sql and sql_query:
+        with st.expander("🔍 SQL Query"):
+            st.code(sql_query, language="sql")
+
+# --- בדיקה אם המשתמש ביקש לראות SQL ---
+SQL_KEYWORDS = ["show sql", "show the sql", "show query", "sql used", "תציג קוד", "תציג שאילתה", "קוד sql", "מקור נתונים"]
+
+def user_wants_sql(query: str) -> bool:
+    q = query.lower()
+    return any(kw in q for kw in SQL_KEYWORDS)
 
 # --- ממשק משתמש (Chat) ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# הצגת שאלות לדוגמה בפעם הראשונה
+# שאלות לדוגמה בפעם הראשונה
 if not st.session_state.messages:
     st.markdown("""
 <div style="direction: rtl; text-align: right; background-color: #e8f4fd; border-left: 4px solid #1f77b4; border-radius: 6px; padding: 16px; margin-bottom: 16px;">
@@ -116,15 +165,20 @@ if not st.session_state.messages:
 <li>מה ממוצע ה-Credit Score של לקוחות ב-Default לעומת לקוחות תקינים?</li>
 <li>מהם 5 הלקוחות עם הלוואות הגדולות ביותר?</li>
 <li>מה הקשר בין שנות ותק בעבודה לבין Default?</li>
-<li>מה שיעור הכשל הממוצע לפי מצב משפחתי? תציג תוצאה וקוד ומקור נתונים</li>
+<li>מה שיעור הכשל הממוצע לפי מצב משפחתי? תציג שאילתה</li>
 </ul>
 </div>
 """, unsafe_allow_html=True)
 
+# הצגת היסטוריה
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        if message["role"] == "assistant" and isinstance(message.get("data"), dict):
+            render_response(message["data"], show_sql=message.get("show_sql", False))
+        else:
+            st.markdown(message["content"])
 
+# קלט משתמש
 user_query = st.chat_input("שאלו שאלה על תיק האשראי...")
 
 if user_query:
@@ -132,12 +186,23 @@ if user_query:
     with st.chat_message("user"):
         st.markdown(user_query)
 
+    show_sql = user_wants_sql(user_query)
+
     with st.chat_message("assistant"):
         with st.spinner("מנתח את הנתונים ומייצר שאילתה..."):
             try:
-                answer = run_agent(user_query)
+                data = run_agent(user_query)
             except Exception as e:
-                answer = f"אופס, אירעה שגיאה: {e}"
+                data = {
+                    "answer": f"אופס, אירעה שגיאה: {e}",
+                    "sql_query": "",
+                    "confidence_score": 0
+                }
 
-        st.markdown(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        render_response(data, show_sql=show_sql)
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": data.get("answer", ""),
+            "data": data,
+            "show_sql": show_sql
+        })
