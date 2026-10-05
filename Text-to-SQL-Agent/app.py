@@ -8,6 +8,7 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
+from build_vector_db import load_or_build_index, POLICY_PATH
 
 st.set_page_config(
     page_title="AI Credit Risk Assistant",
@@ -16,7 +17,7 @@ st.set_page_config(
 )
 
 st.title("🤖 AI Credit Risk Assistant")
-st.markdown("Ask questions about the loan portfolio in natural language — the agent translates them into SQL queries and returns the results.")
+st.markdown("Ask questions about the loan portfolio, request financial calculations, or consult the credit underwriting policy — the agent routes each question to the right tool (SQL, calculator, or policy retriever).")
 
 # --- API Key ---
 try:
@@ -41,6 +42,19 @@ db = SQLDatabase.from_uri(
     include_tables=["loans", "demographics"],
     sample_rows_in_table_info=2
 )
+
+# --- Policy Vector Store (RAG) ---
+if not os.path.exists(POLICY_PATH):
+    st.error(f"שגיאה: מסמך המדיניות '{POLICY_PATH}' לא נמצא.")
+    st.stop()
+
+@st.cache_resource(show_spinner="טוען את מאגר המדיניות (Vector DB)...")
+def get_policy_retriever(_api_key: str):
+    """Load the FAISS index once per server process (built on first run if missing)."""
+    store = load_or_build_index(_api_key)
+    return store.as_retriever(search_kwargs={"k": 4})
+
+policy_retriever = get_policy_retriever(openai_api_key)
 
 # ─────────────────────────────────────────────
 # FINANCIAL CALCULATOR TOOLS
@@ -139,11 +153,45 @@ def calculate_debt_to_income(monthly_debt_payment: float, monthly_gross_income: 
 
 
 # ─────────────────────────────────────────────
+# POLICY RETRIEVER TOOL (RAG)
+# ─────────────────────────────────────────────
+
+@tool
+def search_credit_policy(query: str) -> str:
+    """
+    Semantic search over the institution's Credit Underwriting Policy (internal document).
+    Use for ANY question about rules, thresholds, definitions, eligibility, tiers, limits,
+    or procedures — e.g. 'what credit score is considered high risk?', 'what is the maximum DTI?',
+    'what are the loan limits for Tier 2?', 'how are defaulted loans handled?',
+    'what does the policy say about marital status / age / employment years?'.
+    Also use it to look up the official definition of a vague term (risky, young, experienced,
+    large loan) BEFORE deciding whether to query the database.
+    query: a short natural-language description of the rule you are looking for (English works best).
+    Returns the most relevant policy passages with their section references.
+    """
+    docs = policy_retriever.invoke(query)
+    passages = []
+    for d in docs:
+        m = d.metadata
+        passages.append({
+            "section": f"{m.get('subsection', '')} {m.get('subsection_title', '')}".strip(),
+            "parent_section": f"Section {m.get('section', '')}: {m.get('section_title', '')}",
+            "text": d.page_content
+        })
+    return json.dumps({
+        "tool": "credit_policy_retriever",
+        "query": query,
+        "num_passages": len(passages),
+        "passages": passages
+    }, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────
 # SYSTEM PROMPT — MULTI-TOOL ROUTER
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a Senior Credit Risk Manager AI assistant at a financial institution.
-You have access to TWO types of tools and must route each question to the correct one.
+You have access to THREE types of tools and must route each question to the correct one(s).
 
 ═══════════════════════════════════════════════
 TOOL ROUTING — DECIDE BEFORE EVERY ANSWER:
@@ -159,9 +207,30 @@ TOOL ROUTING — DECIDE BEFORE EVERY ANSWER:
    - calculate_compound_interest: "If I invest $10,000 at 4% for 10 years, what do I get?"
    - calculate_debt_to_income: "Is a client with $3,000/month income and $900/month payments eligible?"
 
-3. BOTH TOOLS (hybrid) → use when the question combines portfolio data with a calculation:
-   Example: "What is the average monthly payment for the top 10 loans in our portfolio at 5% for 10 years?"
-   → First query the DB for the top 10 loan amounts, then call calculate_monthly_payment for each.
+3. POLICY RETRIEVER TOOL (search_credit_policy) → use for questions about RULES, not data:
+   - Thresholds, tiers, limits, eligibility criteria, definitions, procedures
+   - "What credit score counts as high risk?", "What is the maximum DTI?", "What are the loan limits for Tier 3?"
+   - "How does the policy treat divorced applicants?", "When is a loan written off?"
+   Always cite the section numbers you relied on (e.g. "per policy §2.1").
+   NEVER answer a policy question from memory — if you did not retrieve it, you do not know it.
+
+4. HYBRID → use when the question combines two or more tool types:
+   a) DB + Calculator: "Average monthly payment for the top 10 loans at 5% for 10 years?"
+      → query the DB for the loan amounts, then call calculate_monthly_payment.
+   b) POLICY + DB (the most valuable case): "How many clients fall into the policy's High Risk tier?"
+      → FIRST call search_credit_policy to get the official definition (Tier 4 = credit_score < 550),
+        THEN write the SQL using that exact threshold, and cite the section in the answer.
+      Other examples: "Which clients violate the minimum income rule?", "What share of the portfolio
+      is below the minimum employment duration?", "Is our default rate within the policy benchmark?"
+   c) POLICY + Calculator: "Client earns 8,000/month and pays 3,600 — is that allowed?"
+      → compute DTI, then retrieve the DTI thresholds and apply them.
+
+POLICY LOOKUP FOR VAGUE TERMS:
+When the user uses a vague qualifier (risky, high risk, young, experienced, large loan, good score, etc.),
+FIRST call search_credit_policy to check whether the policy defines it.
+- If the policy defines it → use that definition, state it explicitly in the answer with its section,
+  set confidence_score 70-89 (interpretation based on policy), and proceed.
+- If the policy does NOT define it → fall back to the AMBIGUITY DETECTION rule below and ask.
 
 DATABASE SCHEMA — EXACT, COMPLETE:
 - loans: client_id (INTEGER), age (INTEGER), loan_amount (INTEGER), credit_score (INTEGER), default_status (INTEGER — 0=performing, 1=default)
@@ -177,12 +246,16 @@ Always return a valid JSON object with exactly these fields:
 
 {
   "answer": "Natural language finding in the user's language.",
-  "sql_query": "SQL executed, or empty string if a calculator tool was used instead.",
-  "tool_used": "<one of: database | calculator | hybrid>",
+  "sql_query": "SQL executed, or empty string if no database query was run.",
+  "tool_used": "<one of: database | calculator | policy | hybrid | none>",
   "confidence_score": <integer 0-100>,
   "output_format": "<one of: text | table | sql | text+sql | table+sql | table+text+sql>",
-  "table_data": [ {"column": value, ...}, ... ]
+  "table_data": [ {"column": value, ...}, ... ],
+  "policy_sources": [ "2.1 Credit Score Tiers", ... ]
 }
+
+policy_sources: list the policy section labels (as returned by search_credit_policy in the "section" field)
+that you actually used in the answer. Empty list [] if the policy tool was not used.
 
 OUTPUT FORMAT SELECTION RULES:
 - User asks for a table / טבלה → output_format "table", populate table_data
@@ -197,7 +270,8 @@ CONFIDENCE SCORE RULES:
 - 0-49: Missing data or cannot answer reliably. Ask for clarification.
 
 AMBIGUITY DETECTION — MANDATORY BEFORE EVERY RESPONSE:
-If ANY of these ambiguous qualifiers appear, set confidence_score ≤ 50 and ask for clarification:
+If ANY of these ambiguous qualifiers appear AND the policy does not define them (see POLICY LOOKUP FOR VAGUE TERMS),
+set confidence_score ≤ 50 and ask for clarification:
 - "מסוכן" / "risky" / "high risk" → what criterion? (credit score threshold? default status? formula?)
 - "בעייתי" / "problematic" → what definition?
 - "קשר" / "relationship" / "connection" → what analysis type? (group average? correlation? distribution?)
@@ -213,12 +287,14 @@ If ANY of these ambiguous qualifiers appear, set confidence_score ≤ 50 and ask
 Clarification format: "❓ [specific question about the ambiguous term]. Please clarify so I can run the right analysis."
 
 HALLUCINATION PREVENTION:
-Concepts not in the database: mortgage/משכנתא, interest rate/ריבית, loan type/סוג הלוואה, balance/יתרה.
-If asked about these → confidence_score=0, sql_query="", explain what IS available.
+Concepts not in the database: mortgage/משכנתא, interest rate/ריבית, loan type/סוג הלוואה, balance/יתרה, missed payments, guarantors, collateral.
+If asked for DATA about these → confidence_score=0, sql_query="", explain what IS available.
 For calculator questions, these concepts ARE valid inputs (the user provides them directly).
+For POLICY questions, these concepts may be answered from the retrieved policy text — but ONLY from what was retrieved.
+If search_credit_policy returns nothing relevant → say the policy does not cover it (confidence_score=0). Do not invent rules.
 
 OUT-OF-DOMAIN (recipes, weather, stocks, coding, personal questions, DB modifications):
-{"answer": "⚠️ I'm a Credit Risk Assistant. I can only answer questions about the loan portfolio data or perform financial calculations.", "sql_query": "", "tool_used": "none", "confidence_score": 0, "output_format": "text", "table_data": []}"""
+{"answer": "⚠️ I'm a Credit Risk Assistant. I can only answer questions about the loan portfolio data, the credit underwriting policy, or perform financial calculations.", "sql_query": "", "tool_used": "none", "confidence_score": 0, "output_format": "text", "table_data": [], "policy_sources": []}"""
 
 # ─────────────────────────────────────────────
 # LLM, TOOLS & AGENT
@@ -229,10 +305,11 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=openai_api_key)
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 sql_tools = toolkit.get_tools()
 calculator_tools = [calculate_monthly_payment, calculate_compound_interest, calculate_debt_to_income]
+policy_tools = [search_credit_policy]
 
 agent = create_agent(
     model=llm,
-    tools=sql_tools + calculator_tools,
+    tools=sql_tools + calculator_tools + policy_tools,
     system_prompt=SYSTEM_PROMPT
 )
 
@@ -243,6 +320,7 @@ agent = create_agent(
 TOOL_BADGES = {
     "database":   ("#1f77b4", "🗄️ Database"),
     "calculator": ("#6f42c1", "🧮 Calculator"),
+    "policy":     ("#20a39e", "📜 Policy (RAG)"),
     "hybrid":     ("#e67e22", "🔀 Hybrid"),
     "none":       ("#6c757d", "⚠️ N/A"),
 }
@@ -282,12 +360,14 @@ def run_agent(query: str) -> dict:
         data.setdefault("confidence_score", 50)
         data.setdefault("output_format", "text")
         data.setdefault("table_data", [])
+        data.setdefault("policy_sources", [])
         return data
     except (json.JSONDecodeError, AttributeError):
         return {
             "answer": raw or "לא התקבלה תשובה מהסוכן.",
             "sql_query": "", "tool_used": "database",
-            "confidence_score": 50, "output_format": "text", "table_data": []
+            "confidence_score": 50, "output_format": "text", "table_data": [],
+            "policy_sources": []
         }
 
 CONFIDENCE_THRESHOLD = 70  # מתחת לסף זה → לא מציגים תשובה, רק בקשת הבהרה
@@ -299,6 +379,7 @@ def render_response(data: dict):
     confidence   = data.get("confidence_score", 0)
     table_data   = data.get("table_data", [])
     tool_used    = data.get("tool_used", "database")
+    sources      = data.get("policy_sources", []) or []
 
     # ── PYTHON-LEVEL ENFORCEMENT: confidence < threshold ──────────────────
     # גם אם הסוכן "שכח" לבקש הבהרה בפרומפט — הקוד מאכף
@@ -343,6 +424,12 @@ def render_response(data: dict):
         with st.expander("🔍 SQL Query"):
             st.code(sql_query, language="sql")
 
+    # Policy sources expander (RAG transparency)
+    if sources:
+        with st.expander(f"📜 Policy sources ({len(sources)})"):
+            for s in sources:
+                st.markdown(f"- §{s}")
+
 # ─────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────
@@ -361,6 +448,8 @@ if not st.session_state.messages:
 <li>לקוח מרוויח 8,000 ₪ בחודש ומשלם 2,400 ₪. מה יחס ה-DTI שלו?</li>
 <li>מה שיעור הכשל הממוצע לפי מצב משפחתי? תציג שאילתה</li>
 <li>אם אשקיע 100,000 ₪ בריבית 4% ל-10 שנים, כמה אקבל?</li>
+<li>📜 מה המדיניות אומרת לגבי יחס DTI מקסימלי?</li>
+<li>📜 כמה לקוחות בתיק נחשבים High Risk לפי המדיניות? הצג שאילתה</li>
 </ul>
 </div>
 """, unsafe_allow_html=True)
