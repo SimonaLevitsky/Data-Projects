@@ -2,7 +2,7 @@
 Policy-category enforcement (Python-level, model-independent)
 =============================================================
 The system prompt asks the agent to cover EVERY policy section that defines a
-category (e.g. "High Risk" appears in §2.1, §4.1 and §8.1) and to check every
+category (e.g. "High Risk" appears in Sections 2.1, 4.1 and 8.1) and to check every
 checkable criterion in SQL. A small model tends to ignore that and answer from a
 single section, so the code enforces it in three steps:
 
@@ -145,7 +145,7 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
     for c in categories:
         lines = []
         for s in c["sections"]:
-            lines.append(f"  §{s['section']}:")
+            lines.append(f"  Section {s['section']}:")
             lines += [f"    - {ln}" for ln in s["matching_lines"]]
         cols = ", ".join(c["columns"]) or "none"
         parts.append(
@@ -156,9 +156,15 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
         )
 
     sql_req = (
-        "2. Run ONE SQL query that checks EVERY criterion that maps to the DB columns listed above: "
-        "a count per criterion, a combined count (meets ANY criterion), and the total. For a loan-amount "
-        "LIMIT, count the clients in the category whose loan_amount EXCEEDS the limit (policy violations).\n"
+        "2. Separate CLASSIFICATION criteria (score / employment / income / age thresholds that make a client "
+        "belong to the category) from LIMITS (max loan amount, guarantors, committee review — rules for clients "
+        "already in the category). Run ONE SQL query with: a count per classification criterion; ONE combined "
+        "count of clients meeting AT LEAST ONE classification criterion (OR over the classification criteria "
+        "ONLY — never put a loan-amount limit inside this OR); for each checkable limit, the number of "
+        "violations counted ONLY among clients who meet the matching classification criterion "
+        "(e.g. credit_score < 550 AND loan_amount > 50000); and the total.\n"
+        "   Label the combined line EXACTLY: Hebrew \"לקוחות שעומדים בלפחות קריטריון אחד: <n>\" / "
+        "English \"Clients meeting at least one criterion: <n>\".\n"
         if enforce_sql else
         "2. If you query the database, check EVERY criterion that maps to the DB columns listed above.\n"
     )
@@ -167,8 +173,9 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
         "sections for the category in the question; you do not need to call find_all_policy_mentions again.]\n"
         + "\n\n".join(parts)
         + "\n\nREQUIREMENTS FOR YOUR ANSWER (MANDATORY WORKFLOW):\n"
-        "1. List EVERY criterion from EVERY section above, each with its exact section number (§x.y). "
-        "Use ONLY the section numbers given here.\n"
+        "1. List EVERY criterion from EVERY section above, each with its exact section number. "
+        "Use ONLY the section numbers given here. NEVER write the '§' sign — write the word: "
+        "Hebrew 'סעיף 2.1', English 'Section 2.1'.\n"
         + sql_req +
         "3. Under 'Data limitations', list every criterion that cannot be checked in the data and why "
         "(guarantors, Credit Committee review, approval rates, collateral, DTI, missed payments... are NOT in the DB).\n"
@@ -185,10 +192,14 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
     """Which expected sections / SQL columns are missing from the agent's JSON answer."""
     cited = set()
     for s in data.get("policy_sources", []) or []:
-        m = re.match(r"\s*§?\s*(\d+\.\d+)", str(s))
+        m = re.match(r"\s*(?:§|section|סעיף)?\s*(\d+\.\d+)", str(s), flags=re.IGNORECASE)
         if m:
             cited.add(m.group(1))
-    cited.update(re.findall(r"§\s*(\d+\.\d+)", str(data.get("answer", "") or "")))
+    answer_text = str(data.get("answer", "") or "")
+    cited.update(re.findall(r"(?:§|section|סעיף)\s*(\d+\.\d+)", answer_text, flags=re.IGNORECASE))
+    # plural lists: "סעיפים 2.1, 4.1 ו-8.1" / "Sections 2.1, 4.1 and 8.1"
+    for lst in re.findall(r"(?:sections|סעיפים)\s*((?:\d+\.\d+[\s,]*(?:and|ו-|ו)?\s*)+)", answer_text, flags=re.IGNORECASE):
+        cited.update(re.findall(r"\d+\.\d+", lst))
 
     sql = (data.get("sql_query") or "").lower()
     expected_sections, expected_columns = [], []
@@ -210,7 +221,7 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
 def build_correction(report: dict) -> str:
     msg = "Your previous answer is INCOMPLETE and was REJECTED by an automatic completeness check.\n"
     if report["missing_sections"]:
-        msg += "- Policy sections you did not cover: " + ", ".join("§" + s for s in report["missing_sections"]) + "\n"
+        msg += "- Policy sections you did not cover: " + ", ".join("Section " + s for s in report["missing_sections"]) + "\n"
     if report["missing_columns"]:
         msg += "- DB columns your SQL did not check: " + ", ".join(report["missing_columns"]) + "\n"
     msg += (
@@ -232,4 +243,4 @@ if __name__ == "__main__":
               "מה אחוז ה-Default בתיק?"]:
         cats = detect_policy_categories(q, chunks)
         print(f"\nQ: {q}\n   data intent: {wants_data(q)} | categories: "
-              + (", ".join(f"{c['label']} → §{'/§'.join(c['section_ids'])} | cols={c['columns']}" for c in cats) or "none"))
+              + (", ".join(f"{c['label']} → Sections {'/'.join(c['section_ids'])} | cols={c['columns']}" for c in cats) or "none"))

@@ -249,9 +249,11 @@ TOOL ROUTING — DECIDE BEFORE EVERY ANSWER:
    - find_all_policy_mentions(terms): EXHAUSTIVE scan — returns EVERY section mentioning a category/label.
      MANDATORY whenever the question names a policy-defined category (High Risk, Low Risk, Tier 1-4,
      Prime, Sub-Prime, Watch, Substandard, guarantor, collateral, Credit Committee, minimum income...).
-     A category is often defined in SEVERAL sections (e.g. "High Risk" appears in §2.1, §4.1 and §8.1);
+     A category is often defined in SEVERAL sections (e.g. "High Risk" appears in Sections 2.1, 4.1 and 8.1);
      a single semantic search would miss some of them, which makes the answer INCOMPLETE and WRONG.
-   Always cite the section numbers you relied on (e.g. "per policy §2.1").
+   Always cite the section numbers you relied on.
+   SECTION CITATION FORMAT — NEVER use the "§" sign. Write the word:
+     Hebrew answer → "סעיף 2.1" (plural: "סעיפים 2.1, 4.1 ו-8.1");  English answer → "Section 2.1".
    NEVER answer a policy question from memory — if you did not retrieve it, you do not know it.
 
 4. HYBRID → use when the question combines two or more tool types:
@@ -285,22 +287,38 @@ STEP 2 — MAP EACH CRITERION TO THE DATABASE SCHEMA. For every criterion decide
    Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it);
    "above 200,000" → loan_amount > 200000. Always state the exact operator you used.
 
-STEP 3 — RUN ONE SQL QUERY covering ALL checkable criteria, with a separate count per criterion,
-   a combined count (OR = meets ANY criterion), and the total, e.g.:
+STEP 3 — SEPARATE "CLASSIFICATION CRITERIA" FROM "LIMITS", THEN RUN ONE SQL QUERY.
+   (a) CLASSIFICATION CRITERIA = what makes a client BELONG to the category:
+       credit score ranges, employment duration, income, age (e.g. credit_score < 550, employment_years < 1).
+   (b) LIMITS / CONSEQUENCES = rules that apply to clients who are ALREADY in the category:
+       maximum loan amount, guarantors, Credit Committee review, collateral, max term.
+       A limit is NOT a membership criterion: "loan_amount > 50000" alone does NOT make a client High Risk.
+   The query must contain:
+     - one count per classification criterion (a);
+     - ONE combined count = clients meeting AT LEAST ONE classification criterion (OR over (a) ONLY —
+       never include a limit column in this OR);
+     - for each checkable limit (b): the number of VIOLATIONS, counted ONLY among clients who meet the
+       matching classification criterion (e.g. credit_score < 550 AND loan_amount > 50000);
+     - the total number of clients.
+   Example:
    SELECT
-     SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)                 AS tier4_score_below_550,
-     SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)               AS employment_under_1_year,
-     SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 THEN 1 ELSE 0 END) AS high_risk_any,
-     SUM(CASE WHEN l.credit_score < 550 AND l.loan_amount > 50000 THEN 1 ELSE 0 END) AS tier4_above_50k_limit,
+     SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)                                AS score_below_550,
+     SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)                              AS employment_under_1_year,
+     SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 THEN 1 ELSE 0 END)      AS at_least_one_criterion,
+     SUM(CASE WHEN l.credit_score < 550 AND l.loan_amount > 50000 THEN 1 ELSE 0 END)      AS tier4_above_50k_limit,
+     SUM(CASE WHEN d.employment_years < 1 AND l.loan_amount >= 30000 THEN 1 ELSE 0 END)   AS new_employee_above_30k_limit,
      COUNT(*) AS total_clients
    FROM loans l JOIN demographics d ON l.client_id = d.client_id;
-   When the policy sets a LIMIT for the category (max loan amount, max term...), also count the clients
-   in that category who EXCEED the limit — these are potential policy violations and are highly valuable.
 
 STEP 4 — ANSWER STRUCTURE (in the user's language):
-   1. "According to the policy, <label> is defined by:" — bullet per criterion WITH its section (§x.y).
-      Include ALL sections found, even those that cannot be checked in the data.
-   2. "What was checked in the data:" — the numbers per checkable criterion + combined count + total.
+   1. "According to the policy, <label> is defined by:" — bullet per criterion WITH its section number
+      ("סעיף 2.1" / "Section 2.1"). Include ALL sections found, even those that cannot be checked in the data.
+   2. "What was checked in the data:" — one line per classification criterion, then EXACTLY this line:
+         Hebrew:  "לקוחות שעומדים בלפחות קריטריון אחד: <n>"
+         English: "Clients meeting at least one criterion: <n>"
+      then the limit-violation lines, labelled as violations among the category members, e.g.
+         "לקוחות עם ציון מתחת ל-550 שההלוואה שלהם מעל תקרת 50,000 ש"ח (חריגה ממדיניות): <n>"
+      and finally the total.
    3. "⚠️ Data limitations:" — list every criterion that could NOT be checked and WHY (which information
       is missing from the DB). State clearly that the result is therefore PARTIAL / a lower bound.
    4. Any boundary assumptions you made (e.g. employment_years < 1).
@@ -309,12 +327,13 @@ STEP 4 — ANSWER STRUCTURE (in the user's language):
    NEVER present a single-criterion count as "the" answer when the policy lists several criteria.
 
 WORKED EXAMPLE — "How many clients in the portfolio are High Risk according to the policy?"
-   → find_all_policy_mentions("high risk|tier 4") returns §2.1 (Tier 4: score below 550, Credit Committee
-     review, max 50,000 ILS, two guarantors, <15% approval), §4.1 (0–1 years employment: high risk,
-     loans restricted below 30,000 ILS), §8.1 (Tier 4: up to 50,000 ILS with two guarantors + Committee).
-   → Checkable: credit_score < 550 (§2.1/§8.1); employment_years < 1 (§4.1); loan_amount vs the
-     50,000 / 30,000 limits (violation check). Not in data: guarantors, Credit Committee review,
-     approval rate.
+   → find_all_policy_mentions("high risk|tier 4") returns Section 2.1 (Tier 4: score below 550, Credit
+     Committee review, max 50,000 ILS, two guarantors, <15% approval), Section 4.1 (0–1 years employment:
+     high risk, loans restricted below 30,000 ILS), Section 8.1 (Tier 4: up to 50,000 ILS with two
+     guarantors + Committee).
+   → Classification criteria: credit_score < 550 (Sections 2.1/8.1); employment_years < 1 (Section 4.1).
+     Limits (violation checks only): loan_amount > 50,000 among score < 550; loan_amount >= 30,000 among
+     employment_years < 1. Not in data: guarantors, Credit Committee review, approval rate.
    → Run the SQL from STEP 3, then answer with the 4-part structure above.
 
 POLICY LOOKUP FOR VAGUE TERMS:
@@ -345,8 +364,8 @@ Always return a valid JSON object with exactly these fields:
   "table_data": [ {"column": value, ...}, ... ],
   "policy_sources": [ "2.1 Credit Score Tiers", ... ],
   "data_coverage": {
-    "checked": [ "credit_score < 550 (§2.1)", ... ],
-    "missing": [ "Two guarantors required (§2.1) — guarantor data not in DB", ... ]
+    "checked": [ "credit_score < 550 (Section 2.1)", ... ],
+    "missing": [ "Two guarantors required (Section 2.1) — guarantor data not in DB", ... ]
   }
 }
 
@@ -481,7 +500,7 @@ def parse_agent_output(result: dict) -> dict:
         data.setdefault("table_data", [])
         data.setdefault("policy_sources", [])
         data.setdefault("data_coverage", {"checked": [], "missing": []})
-        return data
+        return strip_section_sign(data)
     except (json.JSONDecodeError, AttributeError):
         return {
             "answer": raw or "לא התקבלה תשובה מהסוכן.",
@@ -527,16 +546,32 @@ def run_agent(query: str) -> dict:
 
 CONFIDENCE_THRESHOLD = 70  # מתחת לסף זה → לא מציגים תשובה, רק בקשת הבהרה
 
+def section_label(source: str, hebrew: bool) -> str:
+    """'2.1 Credit Score Tiers' → 'סעיף 2.1 Credit Score Tiers' / 'Section 2.1 Credit Score Tiers'."""
+    s = re.sub(r"^\s*(§|section|סעיף)?\s*", "", str(source), flags=re.IGNORECASE)
+    return ("סעיף " if hebrew else "Section ") + s
+
+def strip_section_sign(data: dict) -> dict:
+    """Safety net: the model must not emit '§' — replace it with the word in the answer's language."""
+    word = "סעיף " if is_hebrew(data.get("answer", "")) else "Section "
+    data["answer"] = re.sub(r"§\s*", word, data.get("answer", "") or "")
+    data["policy_sources"] = [re.sub(r"^\s*§\s*", "", str(s)) for s in data.get("policy_sources", []) or []]
+    cov = data.get("data_coverage")
+    if isinstance(cov, dict):
+        for k in ("checked", "missing"):
+            cov[k] = [re.sub(r"§\s*", word, str(x)) for x in cov.get(k, []) or []]
+    return data
+
 def render_completeness(comp):
     """Show the verdict of the Python-level policy completeness check (if the question triggered it)."""
     if not comp:
         return
     cats = ", ".join(comp.get("categories", []))
-    secs = ", ".join("§" + s for s in comp.get("expected_sections", []))
+    secs = "Sections " + ", ".join(comp.get("expected_sections", []))
     if comp.get("missing_sections") or comp.get("missing_columns"):
         parts = []
         if comp.get("missing_sections"):
-            parts.append("policy sections not covered: " + ", ".join("§" + s for s in comp["missing_sections"]))
+            parts.append("policy sections not covered: " + ", ".join(comp["missing_sections"]))
         if comp.get("missing_columns"):
             parts.append("criteria not checked in SQL: " + ", ".join(comp["missing_columns"]))
         st.warning(
@@ -616,7 +651,7 @@ def render_response(data: dict):
     if sources:
         with st.expander(f"📜 Policy sources ({len(sources)})"):
             for s in sources:
-                st.markdown(f"- §{s}")
+                rtl_markdown(f"- {section_label(s, hebrew=is_hebrew(answer))}")
 
     # Data coverage expander — what was verified in the DB vs. what the data cannot answer
     if checked or missing:
