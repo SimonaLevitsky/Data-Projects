@@ -157,17 +157,17 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
 
     if enforce_sql:
         data_req = (
-            "2. Separate CLASSIFICATION criteria (score / employment / income / age thresholds that make a client "
-            "belong to the category) from LIMITS (max loan amount, guarantors, committee review — rules for clients "
-            "already in the category). Run ONE SQL query with: a count per classification criterion; ONE combined "
-            "count of clients meeting AT LEAST ONE classification criterion (OR over the classification criteria "
-            "ONLY — never put a loan-amount limit inside this OR); for each checkable limit, the violations counted "
-            "ONLY among clients who meet the matching classification criterion (e.g. credit_score < 550 AND "
-            "loan_amount > 50000); and the total.\n"
+            "2. ONE condition per section listed above (the section's numeric threshold for the category), each "
+            "checked STANDALONE over the WHOLE portfolio — never combined with AND, never nested inside another "
+            "condition, no secondary thresholds from the same section. Run ONE SQL query with: one count per "
+            "condition; ONE combined count = clients meeting AT LEAST ONE of the conditions (OR over ALL of "
+            "them); and the total.\n"
             "3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {\"מדד\": label, \"ערך\": n} "
-            "(English: Metric / Value), in THIS order: one row per section bullet (criterion → count; limit → "
-            "violations among the category), then EXACTLY \"לקוחות שעומדים בלפחות קריטריון אחד\" / "
-            "\"Clients meeting at least one criterion\", then \"סך כל הלקוחות\" / \"Total clients\". "
+            "(English: Metric / Value), in THIS order: one row per condition in bullet order (e.g. "
+            "\"לקוחות עם ציון מתחת ל-550\", \"לקוחות עם 0–1 שנות תעסוקה\", "
+            "\"לקוחות שההלוואה שלהם מעל תקרת 50,000 ש\"ח\"), then EXACTLY "
+            "\"לקוחות שעומדים בלפחות קריטריון אחד\" / \"Clients meeting at least one criterion\", then "
+            "\"סך כל הלקוחות\" / \"Total clients\". No other rows. "
             "Set output_format to \"table+text\" (+sql if the user asked for the query).\n"
         )
     else:
@@ -248,7 +248,7 @@ def build_correction(report: dict) -> str:
     msg += (
         "Rewrite the COMPLETE answer now, following the MANDATORY WORKFLOW: cover EVERY section listed in the "
         "POLICY CONTEXT with its exact section number, run ONE SQL query that checks EVERY checkable criterion "
-        "(including limit violations), list the unverifiable criteria under data limitations, and fill "
+        "(each condition standalone over the whole portfolio, then at least one condition, then total), list the unverifiable requirements in data_coverage.missing, and fill "
         "policy_sources and data_coverage. Return ONLY the JSON object."
     )
     return msg
