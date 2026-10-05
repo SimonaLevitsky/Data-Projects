@@ -471,7 +471,9 @@ OUT-OF-DOMAIN (recipes, weather, stocks, coding, personal questions, DB modifica
 # LLM, TOOLS & AGENT
 # ─────────────────────────────────────────────
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=openai_api_key, timeout=90, max_retries=2)
+MODEL_NAME = "gpt-4o-mini"
+llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=openai_api_key, timeout=90, max_retries=2)
+st.session_state.setdefault("model_name", MODEL_NAME)
 AGENT_RECURSION_LIMIT = 30  # max agent steps (model calls + tool calls) per attempt — prevents endless tool loops
 
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
@@ -870,3 +872,40 @@ if user_query:
             "content": data.get("answer", ""),
             "data": data
         })
+
+# ─────────────────────────────────────────────
+# BENCHMARK (golden dataset) — runs the real run_agent in-process, scores with benchmark.py
+# ─────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 📊 Benchmark")
+    st.caption("Golden dataset: 15 core + 3 poison questions. Takes a few minutes.")
+    if st.button("Run benchmark", help="Runs every golden question through the agent and scores it (BIRD-style Execution Accuracy, routing, policy, rejection)."):
+        from benchmark import load_dataset, run_benchmark, build_report, render_markdown
+        _questions = load_dataset()["questions"]
+        _prog = st.progress(0.0, text="Starting benchmark…")
+
+        def _run(question: str):
+            _t = time.time()
+            return run_agent(question), time.time() - _t
+
+        def _progress(i, n, q):
+            _prog.progress((i - 1) / n, text=f"{q['id']} ({i}/{n}) — {q['type']}")
+
+        _results = run_benchmark(_run, _questions, progress=_progress)
+        _prog.progress(1.0, text="Done")
+        _report = build_report(_results, {"runner": "in-app", "model": MODEL_NAME})
+        st.session_state["benchmark_report_md"] = render_markdown(_report)
+        st.session_state["benchmark_report_json"] = json.dumps(_report, ensure_ascii=False, indent=2, default=str)
+
+if st.session_state.get("benchmark_report_md"):
+    with st.expander("📊 Benchmark report", expanded=True):
+        st.markdown(st.session_state["benchmark_report_md"])
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("⬇️ report (.md)", st.session_state["benchmark_report_md"], "benchmark_report.md", "text/markdown")
+        c2.download_button("⬇️ results (.json)", st.session_state["benchmark_report_json"], "benchmark_results.json", "application/json")
+        if c3.button("Clear report"):
+            st.session_state.pop("benchmark_report_md", None)
+            st.session_state.pop("benchmark_report_json", None)
+            st.rerun()

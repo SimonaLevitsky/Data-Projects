@@ -38,7 +38,7 @@ POLICY_CATEGORIES = [
     ("Collateral",                r"collateral|בטוח",                                     "collateral"),
     ("Credit Committee",          r"credit committee|ועדת אשראי",                         "credit committee"),
     ("Eligibility",               r"eligib|זכאות|זכאי",                                   "eligib"),
-    ("Minimum income",            r"minimum (annual )?income|הכנסה מינימלית",             "minimum annual income|minimum income"),
+    ("Minimum income",            r"minimum (annual )?income|הכנסה[^.]{0,20}מינימלית|מינימום הכנסה",             "minimum annual income|minimum income"),
     ("Preferred applicant",       r"preferred applicant|מועמד מועדף",                     "preferred applicant"),
     ("Watch list",                r"\bwatch\b",                                           "watch"),
     ("Substandard",               r"substandard",                                         "substandard"),
