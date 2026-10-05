@@ -1,0 +1,156 @@
+CREDIT UNDERWRITING POLICY — INTERNAL DOCUMENT
+Financial Institution Credit Risk Division
+Version 3.2 | Effective Date: January 2025
+
+═══════════════════════════════════════════════════════
+SECTION 1: LOAN ELIGIBILITY CRITERIA
+═══════════════════════════════════════════════════════
+
+1.1 Minimum Eligibility Requirements
+All loan applicants must meet the following baseline criteria to be considered for approval:
+- Minimum age: 21 years. Maximum age at loan maturity: 70 years.
+- Minimum employment duration: 12 consecutive months with current employer.
+- Minimum annual income: 60,000 ILS (or equivalent in approved currency).
+- Active bank account for at least 6 months.
+- No open bankruptcy proceedings.
+
+1.2 Residency and Documentation
+Applicants must provide proof of residency, valid government-issued ID, three months of recent pay stubs, and the last two years of tax returns. Self-employed applicants must provide certified financial statements for the last two fiscal years.
+
+═══════════════════════════════════════════════════════
+SECTION 2: CREDIT SCORE REQUIREMENTS
+═══════════════════════════════════════════════════════
+
+2.1 Credit Score Tiers
+The institution uses a tiered credit score framework for loan classification:
+
+- Tier 1 — Prime (Score 750–850): Eligible for all loan products. Best available interest rates. No additional collateral required for standard loan amounts.
+- Tier 2 — Near-Prime (Score 650–749): Eligible for most loan products. Standard interest rates apply. Loans above 200,000 ILS require one guarantor.
+- Tier 3 — Sub-Prime (Score 550–649): Restricted loan products only. Interest rate premium of 2.5% above base rate. Mandatory collateral for all loans. Maximum loan term: 5 years.
+- Tier 4 — High Risk (Score below 550): Loan approval requires Credit Committee review. Maximum loan amount: 50,000 ILS. Two guarantors mandatory. Approval rate for this tier is historically below 15%.
+
+2.2 Recent Credit Events
+Applicants with any of the following in the past 24 months are automatically escalated to Credit Committee review:
+- Loan default on any financial product.
+- Three or more missed payments.
+- Debt restructuring or settlement agreements.
+- Repossession of secured assets.
+
+2.3 Credit Score Monitoring
+Approved clients are subject to quarterly credit score monitoring. A drop of more than 80 points from the score at origination triggers a mandatory account review and may result in reclassification to a higher-risk tier.
+
+═══════════════════════════════════════════════════════
+SECTION 3: DEBT-TO-INCOME RATIO (DTI) POLICY
+═══════════════════════════════════════════════════════
+
+3.1 DTI Thresholds
+The Debt-to-Income ratio is calculated as total monthly debt obligations divided by gross monthly income:
+
+- DTI below 28%: Preferred applicant. Approved automatically if credit score is Tier 1 or Tier 2.
+- DTI 28%–36%: Acceptable. Standard approval process applies. Requires income verification.
+- DTI 36%–43%: Borderline. Requires Credit Officer review. Approval conditional on strong credit score (above 680) and stable employment exceeding 3 years.
+- DTI above 43%: Rejected automatically. No exceptions unless the excess is due to a short-term, documented medical expense, in which case a single-level appeal is permitted.
+
+3.2 DTI Calculation Rules
+- Only recurring monthly obligations are included: existing loan payments, credit card minimum payments, rent/mortgage, and court-ordered payments.
+- Excluded from DTI: utility bills, groceries, insurance premiums, and voluntary savings contributions.
+- For variable income earners (commission-based, freelance), DTI is calculated using the average of the last 24 months of gross income.
+
+═══════════════════════════════════════════════════════
+SECTION 4: EMPLOYMENT AND INCOME VERIFICATION
+═══════════════════════════════════════════════════════
+
+4.1 Employment Stability Standards
+Employment duration is a key risk indicator. The following guidelines apply:
+
+- 0–1 years of employment: High risk. Loan applications restricted to amounts below 30,000 ILS.
+- 1–3 years of employment: Moderate risk. Standard loan products available with income verification.
+- 3–7 years of employment: Low risk. Preferential terms available.
+- Over 7 years of employment: Very low risk. Eligible for maximum loan amounts and best available terms.
+
+4.2 Income Sources
+Acceptable income sources for DTI calculation:
+- Primary employment salary (verified by employer letter and pay stubs).
+- Pension income (for retirees aged 60+, verified by pension fund statement).
+- Rental income, provided it has been declared for tax purposes for at least 2 years.
+- Spousal income may be included only when the spouse is a co-applicant.
+
+4.3 Self-Employment Policy
+Self-employed applicants are subject to a 10% income discount applied before DTI calculation, to account for income volatility. Business expenses reported on tax returns are not considered personal income.
+
+═══════════════════════════════════════════════════════
+SECTION 5: RISK CATEGORIES AND LOAN CLASSIFICATION
+═══════════════════════════════════════════════════════
+
+5.1 Portfolio Risk Classification
+All active loans are classified quarterly into one of four categories:
+
+- Performing (Green): Loan is current. No missed payments. Default probability below 5%.
+- Watch (Yellow): One or two missed payments in the last 12 months, or credit score drop of 50–80 points. Assigned to a relationship manager for monitoring.
+- Substandard (Orange): Three or more missed payments, or DTI deterioration beyond 43%. Provisioning of 20% of outstanding balance required.
+- Default (Red): Loan is 90+ days overdue. Full provisioning required. Transferred to the Recovery Unit. Legal proceedings may be initiated after 180 days.
+
+5.2 Default Rate Benchmarks
+The institution targets a portfolio default rate below 8% on an annual basis. Divisions exceeding 10% default rate for two consecutive quarters are subject to a mandatory portfolio review and lending restriction.
+
+5.3 Concentration Risk
+No single borrower may represent more than 2% of the total loan portfolio by outstanding balance. Industry concentration (e.g., real estate, hospitality) is capped at 15% of the total portfolio.
+
+═══════════════════════════════════════════════════════
+SECTION 6: DEFAULT MANAGEMENT AND RECOVERY
+═══════════════════════════════════════════════════════
+
+6.1 Early Intervention (Days 1–30 overdue)
+Upon first missed payment, the Loan Servicing team initiates contact within 5 business days. A payment arrangement may be offered for up to 3 months without Credit Committee approval.
+
+6.2 Restructuring (Days 31–89 overdue)
+Loans overdue between 31 and 89 days may be restructured with the following options:
+- Extension of loan term by up to 24 months.
+- Temporary reduction of monthly payment (interest-only period up to 6 months).
+- Partial write-off, subject to Credit Committee approval and evidence of financial hardship.
+
+6.3 Default and Recovery (Day 90+)
+Loans classified as Default are transferred to the Recovery Unit. The Recovery Unit may:
+- Initiate legal proceedings to collect outstanding balance.
+- Negotiate a settlement for a portion of the outstanding debt (minimum recovery target: 60% of principal).
+- Sell the debt to a third-party debt collection agency at a discount.
+
+6.4 Write-Off Policy
+Loans are written off the balance sheet after 24 consecutive months in Default status, or when the Recovery Unit determines that collection is not economically viable. Write-offs require CFO approval.
+
+═══════════════════════════════════════════════════════
+SECTION 7: SPECIAL CONSIDERATIONS
+═══════════════════════════════════════════════════════
+
+7.1 Marital Status
+Marital status is not used as a standalone approval or rejection criterion. However:
+- Married applicants may include spousal income as a co-applicant, which can improve DTI.
+- Divorced applicants must disclose court-ordered alimony or child support, which counts as a monthly debt obligation in DTI calculation.
+- Widowed applicants: Survivor pension income is treated as stable income if documented.
+
+7.2 Age Considerations
+- Applicants under 25: Maximum loan term is limited to 10 years.
+- Applicants over 60: Loan term may not extend beyond age 70. Pension income accepted as primary income.
+- No loan may be approved if the applicant would be over 75 at the time of final repayment.
+
+7.3 Fair Lending Compliance
+All lending decisions must comply with applicable fair lending laws. Gender, ethnicity, religion, and national origin are strictly prohibited as factors in any lending decision. Random audit samples of 5% of all decisions are reviewed quarterly by the Compliance Department.
+
+═══════════════════════════════════════════════════════
+SECTION 8: LOAN AMOUNT AND TERM LIMITS
+═══════════════════════════════════════════════════════
+
+8.1 Maximum Loan Amounts by Tier
+- Tier 1 (Prime): Up to 500,000 ILS unsecured; up to 2,000,000 ILS with collateral.
+- Tier 2 (Near-Prime): Up to 200,000 ILS unsecured; up to 800,000 ILS with collateral.
+- Tier 3 (Sub-Prime): Up to 80,000 ILS with mandatory collateral.
+- Tier 4 (High Risk): Up to 50,000 ILS with two guarantors and Credit Committee approval.
+
+8.2 Maximum Loan Terms
+- Personal loans: Up to 7 years.
+- Business loans: Up to 10 years.
+- Secured real estate loans: Up to 25 years.
+- All terms subject to age restrictions in Section 7.2.
+
+8.3 Loan-to-Income (LTI) Limits
+The outstanding loan balance may not exceed 5× the applicant's verified annual gross income at origination. For loans above 3× annual income, a second credit officer signature is required for approval.
