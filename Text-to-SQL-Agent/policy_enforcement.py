@@ -53,6 +53,10 @@ CRITERION_RE = re.compile(
     r"marital|married|divorced|widowed|single"
 )
 
+# Criteria the policy may use but the DB cannot verify (DTI, missed payments). Only when such a criterion
+# is present does the answer show a "criteria that cannot be verified" block.
+UNVERIFIABLE_RE = re.compile(r"\bdti\b|debt.to.income|missed payment")
+
 # Criterion keyword → DB column (loan_amount is deliberately absent: amounts are limits, not criteria)
 CRITERION_HINTS = [
     (r"score",                                      "credit_score"),
@@ -141,6 +145,8 @@ def detect_policy_categories(question: str, chunks) -> list[dict]:
                 limits.append(sec)
         if not criteria:            # category defined only by limits → nothing to count; keep for context
             criteria, limits = all_sections, []
+        unverifiable = [s["section"].split(" ")[0] for s in criteria
+                        if UNVERIFIABLE_RE.search(normalize_for_match(" ".join(s["matching_lines"])))]
         found.append({
             "label": label,
             "terms": terms,
@@ -149,6 +155,7 @@ def detect_policy_categories(question: str, chunks) -> list[dict]:
             "section_ids": [s["section"].split(" ")[0] for s in criteria],
             "limit_section_ids": [s["section"].split(" ")[0] for s in limits],
             "columns": columns,
+            "unverifiable_sections": unverifiable,
         })
     return found
 
@@ -243,16 +250,92 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
     missing_in_sources = [s for s in expected_sections if s not in in_sources]
     unexpected_sections = [s for s in excluded_sections if s in in_answer or s in in_sources]
     missing_columns = [c for c in expected_columns if c not in sql] if (enforce_sql or sql) else []
+    # the SQL must be ONE statement over the criteria only — no limit columns, no extra queries
+    statements = [st for st in sql.split(";") if st.strip()]
+    multi_statement = len(statements) > 1
+    forbidden = [c for c in CHECKABLE_COLUMNS if c not in expected_columns]
+    forbidden_columns_used = [c for c in forbidden if re.search(r"\b" + c + r"\b", sql)] if sql else []
+    has_unverifiable = any(c.get("unverifiable_sections") for c in categories)
     return {
         "expected_sections": expected_sections,
         "excluded_sections": excluded_sections,
         "expected_columns": expected_columns,
+        "has_unverifiable": has_unverifiable,
         "missing_sections": missing_sections,          # criterion sections not mentioned in the answer text
         "missing_in_sources": missing_in_sources,      # criterion sections not listed in policy_sources
         "unexpected_sections": unexpected_sections,    # limit-only sections that were wrongly included
         "missing_columns": missing_columns,
-        "ok": not missing_sections and not missing_in_sources and not unexpected_sections and not missing_columns,
+        "multi_statement": multi_statement,            # more than one SQL statement
+        "forbidden_columns_used": forbidden_columns_used,  # limit columns (e.g. loan_amount) in the SQL
+        "ok": not (missing_sections or missing_in_sources or unexpected_sections or missing_columns
+                   or multi_statement or forbidden_columns_used),
     }
+
+
+def sanitize_policy_answer(data: dict, categories: list[dict], report: dict) -> list[str]:
+    """
+    Deterministic clean-up applied AFTER the retry round, so what the user sees is right even if the
+    model ignored a correction. Returns a list of human-readable notes describing what was changed.
+    """
+    notes = []
+    excluded = report.get("excluded_sections", [])
+
+    # 1. SQL: keep only the first statement (the per-criterion count query)
+    sql = data.get("sql_query") or ""
+    statements = [st.strip() for st in sql.split(";") if st.strip()]
+    if len(statements) > 1:
+        data["sql_query"] = statements[0] + ";"
+        notes.append(f"dropped {len(statements) - 1} extra SQL statement(s)")
+
+    # 2. answer text: remove bullet lines that cite an excluded (limit-only) section
+    if excluded:
+        pat = re.compile(r"(?:§|section|סעיף)\s*(" + "|".join(re.escape(s) for s in excluded) + r")\b", re.IGNORECASE)
+        kept, removed = [], []
+        for line in str(data.get("answer", "") or "").split("\n"):
+            (removed if pat.search(line) else kept).append(line)
+        if removed:
+            data["answer"] = "\n".join(kept).strip()
+            notes.append("removed " + ", ".join("Section " + s for s in sorted({m.group(1) for ln in removed for m in [pat.search(ln)] if m})) + " from the answer")
+
+        # 3. policy_sources: drop excluded sections
+        srcs = data.get("policy_sources", []) or []
+        clean = [s for s in srcs if not re.match(r"\s*(?:§|section|סעיף)?\s*(" + "|".join(re.escape(x) for x in excluded) + r")\b", str(s), re.IGNORECASE)]
+        if len(clean) != len(srcs):
+            data["policy_sources"] = clean
+            notes.append("removed limit-only section(s) from policy sources")
+
+        # 4. table rows that mention an excluded section or loan-amount limits
+        rows = data.get("table_data", []) or []
+        clean_rows = [r for r in rows if not (isinstance(r, dict) and r and
+                      (pat.search(str(next(iter(r.values())))) or re.search(r"חריג|violation|תקרת|limit", str(next(iter(r.values()))), re.IGNORECASE)))]
+        if len(clean_rows) != len(rows):
+            data["table_data"] = clean_rows
+            notes.append(f"removed {len(rows) - len(clean_rows)} limit-related table row(s)")
+
+    # 5. "cannot be verified" block only when a criterion truly has no DB column (DTI, missed payments)
+    cov = data.get("data_coverage")
+    if isinstance(cov, dict) and cov.get("missing") and not report.get("has_unverifiable"):
+        cov["missing"] = []
+        notes.append("cleared the 'cannot be verified' list (all criteria are verifiable in the DB)")
+
+    return notes
+
+
+def final_confidence(data: dict, report: dict) -> int:
+    """
+    Confidence policy for policy-category answers: when the completeness check passed and every criterion
+    is verifiable in the DB, the answer is fully grounded → high confidence (≥ 95), whatever the model said.
+    """
+    try:
+        conf = int(data.get("confidence_score", 0))
+    except (TypeError, ValueError):
+        conf = 0
+    if report.get("ok") and not report.get("has_unverifiable"):
+        return max(conf, 95)
+    return conf
+
+
+
 
 
 def build_correction(report: dict) -> str:
@@ -270,11 +353,17 @@ def build_correction(report: dict) -> str:
                 + ", ".join("Section " + s for s in report["unexpected_sections"]) + "\n")
     if report["missing_columns"]:
         msg += "- DB columns your SQL did not check: " + ", ".join(report["missing_columns"]) + "\n"
+    if report.get("multi_statement"):
+        msg += "- Your sql_query contains more than one statement. Return EXACTLY ONE SELECT statement.\n"
+    if report.get("forbidden_columns_used"):
+        msg += ("- Your SQL uses columns that belong to LIMITS, not criteria, and must be removed: "
+                + ", ".join(report["forbidden_columns_used"]) + "\n")
     msg += (
         "Rewrite the COMPLETE answer now, following the MANDATORY WORKFLOW: cover EVERY section listed in the "
         "POLICY CONTEXT with its exact section number, run ONE SQL query that checks EVERY checkable criterion "
-        "(each condition standalone over the whole portfolio, then at least one condition, then total), list the unverifiable requirements in data_coverage.missing, and fill "
-        "policy_sources and data_coverage. Return ONLY the JSON object."
+        "(ONE statement: each criterion standalone over the whole portfolio, then at least one criterion, then total; "
+        "no limit columns, no extra queries), leave data_coverage.missing EMPTY unless a criterion has no DB column, "
+        "and fill policy_sources with the criterion sections only. Return ONLY the JSON object."
     )
     return msg
 

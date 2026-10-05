@@ -12,7 +12,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from build_vector_db import load_or_build_index, load_policy_text, chunk_policy, POLICY_PATH, INDEX_DIR
 from policy_enforcement import (scan_policy, detect_policy_categories, build_policy_context,
-                                check_completeness, build_correction, wants_data)
+                                check_completeness, build_correction, wants_data,
+                                sanitize_policy_answer, final_confidence)
 
 APP_START = time.time()
 
@@ -341,7 +342,8 @@ STEP 2 — SPLIT THE SECTIONS INTO CRITERIA vs LIMITS:
 
 STEP 3 — ONE CONDITION PER CRITERION SECTION, EACH COUNTED OVER THE WHOLE PORTFOLIO:
    Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it).
-   Run ONE SQL query with: one count per criterion, ONE combined count = clients meeting AT LEAST ONE
+   Run EXACTLY ONE SQL statement (never several queries separated by ';') with: one count per criterion,
+   ONE combined count = clients meeting AT LEAST ONE
    criterion (OR over the criteria), and the total:
    SELECT
      SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)                           AS score_below_550,
@@ -375,7 +377,9 @@ STEP 4 — ANSWER STRUCTURE (STRICT — the UI renders these fields in a fixed l
    "data_coverage.checked" = the criteria you verified, each with its section.
    "data_coverage.missing" = ONLY criteria that cannot be verified in the data (e.g. DTI, missed payments).
       Leave it EMPTY when every criterion was verified. Never put limits (guarantors, amounts, committee) there.
-   "policy_sources" = exactly the criterion sections.  confidence_score: 70-89.  tool_used: "hybrid".
+   "policy_sources" = exactly the criterion sections.  tool_used: "hybrid".
+   confidence_score: 90-100 when every criterion is defined by the policy AND verified in the DB (the normal
+   case — the answer is fully grounded); 70-89 only if a criterion could not be verified in the data.
    NEVER present a single-criterion count as "the" answer when the policy lists several criteria.
 
 WORKED EXAMPLE — "How many clients in the portfolio are High Risk according to the policy?"
@@ -612,10 +616,18 @@ def run_agent(query: str, status=None) -> dict:
         data = parse_agent_output(result)
         report = check_completeness(data, categories, enforce_sql)
 
+    # Deterministic clean-up of whatever the model still got wrong, then re-check the cleaned answer
+    cleaned = sanitize_policy_answer(data, categories, report)
+    if cleaned:
+        say("ניקוי אוטומטי: " + "; ".join(cleaned))
+        report = check_completeness(data, categories, enforce_sql)
+    data["confidence_score"] = final_confidence(data, report)
+
     say("בדיקת שלמות עברה ✅" if report["ok"] else "בדיקת שלמות עדיין נכשלת — מציג תשובה חלקית ⚠️")
     data["_completeness"] = {
         "categories": [c["label"] for c in categories],
         "retries": retries,
+        "cleaned": cleaned,
         **report,
     }
     timings["total"] = f"{time.time() - t0:.1f}s"
@@ -688,7 +700,9 @@ def render_completeness(comp):
         return
     cats = ", ".join(comp.get("categories", []))
     secs = "Sections " + ", ".join(comp.get("expected_sections", []))
-    if comp.get("missing_sections") or comp.get("missing_columns") or comp.get("missing_in_sources") or comp.get("unexpected_sections"):
+    if comp.get("cleaned"):
+        st.caption("🧹 Auto-cleaned: " + "; ".join(comp["cleaned"]) + ".")
+    if not comp.get("ok"):
         parts = []
         if comp.get("missing_sections"):
             parts.append("policy sections not covered: " + ", ".join(comp["missing_sections"]))
@@ -698,6 +712,10 @@ def render_completeness(comp):
             parts.append("sections missing from the sources list: " + ", ".join(comp["missing_in_sources"]))
         if comp.get("unexpected_sections"):
             parts.append("limit-only sections wrongly included: " + ", ".join(comp["unexpected_sections"]))
+        if comp.get("multi_statement"):
+            parts.append("SQL contains more than one statement")
+        if comp.get("forbidden_columns_used"):
+            parts.append("SQL uses limit columns: " + ", ".join(comp["forbidden_columns_used"]))
         st.warning(
             f"⚠️ **Completeness check failed — treat this answer as PARTIAL.** "
             f"The policy defines *{cats}* in {secs}. " + "; ".join(parts) + "."
