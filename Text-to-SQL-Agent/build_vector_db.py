@@ -153,7 +153,7 @@ def build_index(api_key: str, verbose: bool = True) -> FAISS:
             m = d.metadata
             print(f"  [{m['subsection']:>4}] {m['subsection_title'][:45]:<45} {len(d.page_content):>5} chars")
 
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=api_key)
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=api_key, timeout=60, max_retries=2)
     store = FAISS.from_documents(docs, embeddings)
     os.makedirs(INDEX_DIR, exist_ok=True)
     store.save_local(INDEX_DIR)
@@ -164,7 +164,7 @@ def build_index(api_key: str, verbose: bool = True) -> FAISS:
 
 def load_or_build_index(api_key: str) -> FAISS:
     """Load the persisted index; build it from credit_policy.txt if missing."""
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=api_key)
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=api_key, timeout=60, max_retries=2)
     if os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
         return FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
     return build_index(api_key, verbose=False)
@@ -180,7 +180,10 @@ if __name__ == "__main__":
     parser.add_argument("-k", type=int, default=3, help="Top-k results for the smoke test.")
     args = parser.parse_args()
 
+    import time
+    t0 = time.time()
     store = build_index(get_api_key())
+    print(f"Build time: {time.time() - t0:.1f}s")
 
     if args.query:
         print(f"\nSmoke test — query: {args.query!r}")

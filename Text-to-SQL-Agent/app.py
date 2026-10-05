@@ -2,6 +2,7 @@ import os
 import re
 import json
 import math
+import time
 import pandas as pd
 import streamlit as st
 from langchain.agents import create_agent
@@ -9,9 +10,11 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from build_vector_db import load_or_build_index, load_policy_text, chunk_policy, POLICY_PATH
+from build_vector_db import load_or_build_index, load_policy_text, chunk_policy, POLICY_PATH, INDEX_DIR
 from policy_enforcement import (scan_policy, detect_policy_categories, build_policy_context,
                                 check_completeness, build_correction, wants_data)
+
+APP_START = time.time()
 
 st.set_page_config(
     page_title="AI Credit Risk Assistant",
@@ -54,16 +57,39 @@ if not os.path.exists(POLICY_PATH):
 @st.cache_resource(show_spinner="טוען את מאגר המדיניות (Vector DB)...")
 def get_policy_retriever(_api_key: str):
     """Load the FAISS index once per server process (built on first run if missing)."""
+    t0 = time.time()
+    existed = os.path.exists(os.path.join(INDEX_DIR, "index.faiss"))
     store = load_or_build_index(_api_key)
-    return store.as_retriever(search_kwargs={"k": 5})
+    info = {
+        "source": "loaded from disk" if existed else "BUILT now (OpenAI embeddings call)",
+        "vectors": store.index.ntotal,
+        "seconds": round(time.time() - t0, 1),
+    }
+    return store.as_retriever(search_kwargs={"k": 5}), info
 
 @st.cache_resource
 def get_policy_chunks():
     """All policy sub-sections in document order — used for exhaustive keyword scans."""
     return chunk_policy(load_policy_text())
 
-policy_retriever = get_policy_retriever(openai_api_key)
+try:
+    policy_retriever, index_info = get_policy_retriever(openai_api_key)
+except Exception as e:
+    st.error(f"שגיאה בטעינת/בניית מאגר המדיניות (Vector DB): {type(e).__name__}: {e}")
+    st.info("בדיקה מהירה מהטרמינל: `python build_vector_db.py` — אם הפקודה נתקעת, הבעיה היא בגישה ל-OpenAI מהמחשב הזה.")
+    st.stop()
 policy_chunks = get_policy_chunks()
+
+# ── Sidebar diagnostics: where does the time go? ──
+with st.sidebar:
+    st.markdown("### 🔧 Diagnostics")
+    st.caption(f"Vector DB: {index_info['source']} · {index_info['vectors']} vectors · {index_info['seconds']}s")
+    st.caption(f"Policy chunks: {len(policy_chunks)} · Startup: {round(time.time() - APP_START, 1)}s")
+    _lt = st.session_state.get("last_timings")
+    if _lt:
+        st.markdown("**Last question**")
+        for k, v in _lt.items():
+            st.caption(f"{k}: {v}")
 
 # ─────────────────────────────────────────────
 # FINANCIAL CALCULATOR TOOLS
@@ -434,7 +460,8 @@ OUT-OF-DOMAIN (recipes, weather, stocks, coding, personal questions, DB modifica
 # LLM, TOOLS & AGENT
 # ─────────────────────────────────────────────
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=openai_api_key)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=openai_api_key, timeout=90, max_retries=2)
+AGENT_RECURSION_LIMIT = 30  # max agent steps (model calls + tool calls) per attempt — prevents endless tool loops
 
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 sql_tools = toolkit.get_tools()
@@ -528,37 +555,63 @@ def parse_agent_output(result: dict) -> dict:
 
 MAX_COMPLETENESS_RETRIES = 1  # one automatic correction round if the answer is incomplete
 
-def run_agent(query: str) -> dict:
+def _invoke_agent(messages: list) -> dict:
+    """One bounded agent run. Raises on timeout / step-limit so the UI can show it instead of hanging."""
+    return agent.invoke({"messages": messages}, config={"recursion_limit": AGENT_RECURSION_LIMIT})
+
+
+def run_agent(query: str, status=None) -> dict:
     """
     Run the agent. If the question mentions a policy-defined category (High Risk, Tier 4, Prime...):
       1. inject ALL the policy sections for that category into the agent's input,
       2. validate the answer (every section cited, every checkable column in the SQL),
       3. retry once with a correction message if something is missing.
     The verdict is attached under data["_completeness"] and surfaced in the UI.
+    `status` is an optional st.status container used to show progress and timings.
     """
+    def say(msg):
+        if status is not None:
+            status.update(label=msg)
+            status.write(f"{time.strftime('%H:%M:%S')} — {msg}")
+
+    timings = {}
+    t0 = time.time()
     categories = detect_policy_categories(query, policy_chunks)
     enforce_sql = wants_data(query)
+    if categories:
+        say(f"זוהתה קטגוריית מדיניות: {', '.join(c['label'] for c in categories)} — מזריק {sum(len(c['sections']) for c in categories)} סעיפים")
 
     agent_input = query + build_policy_context(categories, enforce_sql) if categories else query
-    result = agent.invoke({"messages": [("human", agent_input)]})
+    say("מריץ את הסוכן (ניסיון 1)...")
+    t1 = time.time()
+    result = _invoke_agent([("human", agent_input)])
+    timings["attempt 1"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
     data = parse_agent_output(result)
 
     if not categories:
+        timings["total"] = f"{time.time() - t0:.1f}s"
+        st.session_state["last_timings"] = timings
         return data
 
     retries = 0
     report = check_completeness(data, categories, enforce_sql)
     while not report["ok"] and retries < MAX_COMPLETENESS_RETRIES:
         retries += 1
-        result = agent.invoke({"messages": result["messages"] + [("human", build_correction(report))]})
+        say(f"בדיקת שלמות נכשלה (חסר: {report['missing_sections'] + report['missing_columns']}) — סבב תיקון {retries}...")
+        t1 = time.time()
+        result = _invoke_agent(result["messages"] + [("human", build_correction(report))])
+        timings[f"correction {retries}"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
         data = parse_agent_output(result)
         report = check_completeness(data, categories, enforce_sql)
 
+    say("בדיקת שלמות עברה ✅" if report["ok"] else "בדיקת שלמות עדיין נכשלת — מציג תשובה חלקית ⚠️")
     data["_completeness"] = {
         "categories": [c["label"] for c in categories],
         "retries": retries,
         **report,
     }
+    timings["total"] = f"{time.time() - t0:.1f}s"
+    st.session_state["last_timings"] = timings
     return data
 
 CONFIDENCE_THRESHOLD = 70  # מתחת לסף זה → לא מציגים תשובה, רק בקשת הבהרה
@@ -771,12 +824,14 @@ if user_query:
         rtl_markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("מנתח את הנתונים..."):
+        with st.status("מנתח את הנתונים...", expanded=False) as status:
             try:
-                data = run_agent(user_query)
+                data = run_agent(user_query, status=status)
+                status.update(label="הניתוח הושלם", state="complete")
             except Exception as e:
+                status.update(label=f"שגיאה: {type(e).__name__}", state="error")
                 data = {
-                    "answer": f"אופס, אירעה שגיאה: {e}",
+                    "answer": f"אופס, אירעה שגיאה ({type(e).__name__}): {e}",
                     "sql_query": "", "tool_used": "none",
                     "confidence_score": 0, "output_format": "text", "table_data": []
                 }
