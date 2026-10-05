@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import math
 import pandas as pd
@@ -325,6 +326,28 @@ TOOL_BADGES = {
     "none":       ("#6c757d", "⚠️ N/A"),
 }
 
+HEBREW_RE = re.compile(r"[֐-׿]")
+
+def is_hebrew(text: str) -> bool:
+    """True if the text contains at least one Hebrew letter."""
+    return bool(text) and bool(HEBREW_RE.search(str(text)))
+
+def rtl_markdown(text: str, style: str = ""):
+    """
+    Render markdown; if the text contains Hebrew, wrap it in a right-to-left block.
+    The blank lines around the content keep Markdown (bold, lists, line breaks)
+    rendering normally inside the HTML wrapper.
+    """
+    if not text:
+        return
+    if is_hebrew(text):
+        st.markdown(
+            f'<div dir="rtl" style="direction: rtl; text-align: right; {style}">\n\n{text}\n\n</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(text)
+
 def tool_badge(tool_used: str) -> str:
     color, label = TOOL_BADGES.get(tool_used, ("#6c757d", tool_used))
     return (
@@ -384,10 +407,15 @@ def render_response(data: dict):
     # ── PYTHON-LEVEL ENFORCEMENT: confidence < threshold ──────────────────
     # גם אם הסוכן "שכח" לבקש הבהרה בפרומפט — הקוד מאכף
     if 0 < confidence < CONFIDENCE_THRESHOLD:
-        st.warning(
-            f"⚠️ **Confidence too low to answer ({confidence}%).**\n\n"
-            f"{answer if answer else 'The question is too ambiguous to answer reliably. Please rephrase or provide more detail.'}"
-        )
+        body = answer if answer else "The question is too ambiguous to answer reliably. Please rephrase or provide more detail."
+        if is_hebrew(body):
+            # Custom warning box so the Hebrew clarification request is rendered RTL
+            rtl_markdown(
+                f"⚠️ **רמת הביטחון נמוכה מדי כדי לענות ({confidence}%).**\n\n{body}",
+                style="background-color: #fff3cd; color: #664d03; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px;",
+            )
+        else:
+            st.warning(f"⚠️ **Confidence too low to answer ({confidence}%).**\n\n{body}")
         # Confidence badge בלבד — ללא תוצאה, ללא SQL
         st.markdown(confidence_badge(confidence), unsafe_allow_html=True)
         st.progress(confidence / 100)
@@ -395,14 +423,14 @@ def render_response(data: dict):
 
     # ── confidence = 0: שאלה מחוץ לתחום / נתון חסר ─────────────────────
     if confidence == 0:
-        st.markdown(answer)
+        rtl_markdown(answer)
         return
 
     # ── confidence ≥ threshold: מציגים תשובה מלאה ───────────────────────
 
     # תשובה מילולית
     if answer and ("text" in fmt or "table" not in fmt):
-        st.markdown(answer)
+        rtl_markdown(answer)
 
     # טבלה
     if "table" in fmt:
@@ -412,7 +440,7 @@ def render_response(data: dict):
             except Exception:
                 st.write(table_data)
         elif answer:
-            st.markdown(answer)
+            rtl_markdown(answer)
 
     # Badges row
     badges_html = tool_badge(tool_used) + "&nbsp;&nbsp;" + confidence_badge(confidence)
@@ -459,14 +487,14 @@ for message in st.session_state.messages:
         if message["role"] == "assistant" and isinstance(message.get("data"), dict):
             render_response(message["data"])
         else:
-            st.markdown(message["content"])
+            rtl_markdown(message["content"])
 
 user_query = st.chat_input("שאלו שאלה על תיק האשראי או בקשו חישוב פיננסי...")
 
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
-        st.markdown(user_query)
+        rtl_markdown(user_query)
 
     with st.chat_message("assistant"):
         with st.spinner("מנתח את הנתונים..."):
