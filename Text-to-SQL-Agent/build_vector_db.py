@@ -43,23 +43,39 @@ RULE_LINE_RE = re.compile(r"^═+\s*$", re.MULTILINE)
 # API KEY
 # ─────────────────────────────────────────────
 
-def get_api_key() -> str:
-    """Env var first, then .streamlit/secrets.toml (same sources app.py uses)."""
+def get_api_key(verbose: bool = True) -> str:
+    """
+    Same sources Streamlit's st.secrets uses, in order:
+      1. OPENAI_API_KEY environment variable
+      2. <project>/.streamlit/secrets.toml
+      3. ~/.streamlit/secrets.toml   (user-level file — this is usually where it lives when
+                                      `streamlit run` works but a plain `python` script does not)
+    """
     key = os.getenv("OPENAI_API_KEY")
     if key:
+        if verbose:
+            print("API key source: environment variable")
         return key
-    secrets_path = os.path.join(BASE_DIR, ".streamlit", "secrets.toml")
-    if os.path.exists(secrets_path):
-        try:
-            import tomllib
-            with open(secrets_path, "rb") as f:
-                key = tomllib.load(f).get("OPENAI_API_KEY")
-            if key:
-                return key
-        except Exception:
-            pass
+    candidates = [
+        os.path.join(BASE_DIR, ".streamlit", "secrets.toml"),
+        os.path.join(os.path.expanduser("~"), ".streamlit", "secrets.toml"),
+    ]
+    for secrets_path in candidates:
+        if os.path.exists(secrets_path):
+            try:
+                import tomllib
+                with open(secrets_path, "rb") as f:
+                    key = tomllib.load(f).get("OPENAI_API_KEY")
+                if key:
+                    if verbose:
+                        print(f"API key source: {secrets_path}")
+                    return key
+            except Exception as e:
+                print(f"Could not read {secrets_path}: {e}")
     raise RuntimeError(
-        "OPENAI_API_KEY not found. Set the environment variable or add it to .streamlit/secrets.toml"
+        "OPENAI_API_KEY not found. Looked in: the environment variable, "
+        + ", ".join(candidates)
+        + ". If the Streamlit app runs elsewhere (e.g. Streamlit Cloud), the key lives in that platform's secrets."
     )
 
 

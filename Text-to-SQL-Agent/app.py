@@ -16,6 +16,12 @@ from policy_enforcement import (scan_policy, detect_policy_categories, build_pol
 
 APP_START = time.time()
 
+def startup_log(msg: str):
+    """Terminal-side trace of the startup phases (visible where `streamlit run` was launched)."""
+    print(f"[startup +{time.time() - APP_START:5.1f}s] {msg}", flush=True)
+
+startup_log("imports done")
+
 st.set_page_config(
     page_title="AI Credit Risk Assistant",
     page_icon="🤖",
@@ -26,10 +32,12 @@ st.title("🤖 AI Credit Risk Assistant")
 st.markdown("Ask questions about the loan portfolio, request financial calculations, or consult the credit underwriting policy — the agent routes each question to the right tool (SQL, calculator, or policy retriever).")
 
 # --- API Key ---
+openai_api_key = None
 try:
-    openai_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    openai_api_key = st.secrets.get("OPENAI_API_KEY")
 except Exception:
-    openai_api_key = None
+    pass
+openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
 
 if not openai_api_key:
     st.error("שגיאה: מפתח ה-OPENAI_API_KEY לא נמצא.")
@@ -43,11 +51,13 @@ if not os.path.exists(db_path):
     st.error(f"שגיאה: קובץ מסד הנתונים '{db_path}' לא נמצא.")
     st.stop()
 
+startup_log("API key found; opening SQLite DB")
 db = SQLDatabase.from_uri(
     f"sqlite:///{db_path}",
     include_tables=["loans", "demographics"],
     sample_rows_in_table_info=2
 )
+startup_log("DB ready; parsing policy document (local, no network)")
 
 # --- Policy Vector Store (RAG) ---
 if not os.path.exists(POLICY_PATH):
@@ -72,19 +82,33 @@ def get_policy_chunks():
     """All policy sub-sections in document order — used for exhaustive keyword scans."""
     return chunk_policy(load_policy_text())
 
-try:
-    policy_retriever, index_info = get_policy_retriever(openai_api_key)
-except Exception as e:
-    st.error(f"שגיאה בטעינת/בניית מאגר המדיניות (Vector DB): {type(e).__name__}: {e}")
-    st.info("בדיקה מהירה מהטרמינל: `python build_vector_db.py` — אם הפקודה נתקעת, הבעיה היא בגישה ל-OpenAI מהמחשב הזה.")
-    st.stop()
-policy_chunks = get_policy_chunks()
+def get_retriever():
+    """Lazy accessor: the FAISS index is loaded/built on the FIRST policy question, never at startup."""
+    retriever, info = get_policy_retriever(openai_api_key)
+    st.session_state["index_info"] = info
+    return retriever
+
+policy_chunks = get_policy_chunks()   # local text parsing only — no network
+startup_log("policy chunks ready (vector DB deferred to first policy question); building agent")
 
 # ── Sidebar diagnostics: where does the time go? ──
 with st.sidebar:
     st.markdown("### 🔧 Diagnostics")
-    st.caption(f"Vector DB: {index_info['source']} · {index_info['vectors']} vectors · {index_info['seconds']}s")
+    _info = st.session_state.get("index_info")
+    if _info:
+        st.caption(f"Vector DB: {_info['source']} · {_info['vectors']} vectors · {_info['seconds']}s")
+    elif os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
+        st.caption("Vector DB: on disk — loads on the first policy question")
+    else:
+        st.caption("Vector DB: not built yet — will be built on the first policy question (one OpenAI call)")
     st.caption(f"Policy chunks: {len(policy_chunks)} · Startup: {round(time.time() - APP_START, 1)}s")
+    if st.button("Load / build vector DB now", help="Runs the OpenAI embeddings call explicitly and shows the time or the error."):
+        try:
+            _t = time.time()
+            get_retriever()
+            st.success(f"OK in {time.time() - _t:.1f}s — {st.session_state['index_info']['source']}")
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
     _lt = st.session_state.get("last_timings")
     if _lt:
         st.markdown("**Last question**")
@@ -206,7 +230,7 @@ def search_credit_policy(query: str) -> str:
     NOTE: this is a similarity search — it returns the BEST matches, not necessarily ALL of them.
     When you need every section that mentions a specific category/term, use find_all_policy_mentions.
     """
-    docs = policy_retriever.invoke(query)
+    docs = get_retriever().invoke(query)
     passages = []
     for d in docs:
         m = d.metadata
@@ -473,6 +497,7 @@ agent = create_agent(
     tools=sql_tools + calculator_tools + policy_tools,
     system_prompt=SYSTEM_PROMPT
 )
+startup_log("agent ready; rendering UI")
 
 # ─────────────────────────────────────────────
 # HELPERS
