@@ -9,7 +9,9 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from build_vector_db import load_or_build_index, POLICY_PATH
+from build_vector_db import load_or_build_index, load_policy_text, chunk_policy, POLICY_PATH
+from policy_enforcement import (scan_policy, detect_policy_categories, build_policy_context,
+                                check_completeness, build_correction, wants_data)
 
 st.set_page_config(
     page_title="AI Credit Risk Assistant",
@@ -53,9 +55,15 @@ if not os.path.exists(POLICY_PATH):
 def get_policy_retriever(_api_key: str):
     """Load the FAISS index once per server process (built on first run if missing)."""
     store = load_or_build_index(_api_key)
-    return store.as_retriever(search_kwargs={"k": 4})
+    return store.as_retriever(search_kwargs={"k": 5})
+
+@st.cache_resource
+def get_policy_chunks():
+    """All policy sub-sections in document order — used for exhaustive keyword scans."""
+    return chunk_policy(load_policy_text())
 
 policy_retriever = get_policy_retriever(openai_api_key)
+policy_chunks = get_policy_chunks()
 
 # ─────────────────────────────────────────────
 # FINANCIAL CALCULATOR TOOLS
@@ -169,6 +177,8 @@ def search_credit_policy(query: str) -> str:
     large loan) BEFORE deciding whether to query the database.
     query: a short natural-language description of the rule you are looking for (English works best).
     Returns the most relevant policy passages with their section references.
+    NOTE: this is a similarity search — it returns the BEST matches, not necessarily ALL of them.
+    When you need every section that mentions a specific category/term, use find_all_policy_mentions.
     """
     docs = policy_retriever.invoke(query)
     passages = []
@@ -184,6 +194,31 @@ def search_credit_policy(query: str) -> str:
         "query": query,
         "num_passages": len(passages),
         "passages": passages
+    }, ensure_ascii=False)
+
+
+@tool
+def find_all_policy_mentions(terms: str) -> str:
+    """
+    EXHAUSTIVE scan of the ENTIRE Credit Underwriting Policy for a specific term or category.
+    Returns EVERY sub-section that mentions it (not just the top matches), with the exact matching lines.
+    Use this whenever a question is about a policy-defined category or label, e.g.
+    'High Risk', 'Tier 4', 'Prime', 'Sub-Prime', 'Low Risk', 'Watch', 'Default', 'guarantor',
+    'collateral', 'Credit Committee', 'self-employed', 'minimum income' — so that the answer covers
+    ALL the criteria the policy attaches to that category across all sections.
+    terms: one or more search terms separated by '|' (synonyms are matched independently),
+           e.g. 'high risk|tier 4'  or  'low risk|tier 1|prime'. Case- and hyphen-insensitive.
+    Typical flow: call this first → collect every criterion → then decide which criteria can be
+    checked against the database and which cannot.
+    """
+    matches = scan_policy(policy_chunks, terms)
+    term_list = [t.strip() for t in re.split(r"[|,]", terms) if t.strip()]
+    return json.dumps({
+        "tool": "policy_exhaustive_scan",
+        "terms": term_list,
+        "num_sections_found": len(matches),
+        "sections": matches,
+        "note": "This list is complete: no other sub-section of the policy mentions these terms."
     }, ensure_ascii=False)
 
 
@@ -208,29 +243,85 @@ TOOL ROUTING — DECIDE BEFORE EVERY ANSWER:
    - calculate_compound_interest: "If I invest $10,000 at 4% for 10 years, what do I get?"
    - calculate_debt_to_income: "Is a client with $3,000/month income and $900/month payments eligible?"
 
-3. POLICY RETRIEVER TOOL (search_credit_policy) → use for questions about RULES, not data:
-   - Thresholds, tiers, limits, eligibility criteria, definitions, procedures
-   - "What credit score counts as high risk?", "What is the maximum DTI?", "What are the loan limits for Tier 3?"
-   - "How does the policy treat divorced applicants?", "When is a loan written off?"
+3. POLICY TOOLS → use for questions about RULES, not data:
+   - search_credit_policy(query): semantic search — best for "what does the policy say about X?"
+     "What is the maximum DTI?", "How does the policy treat divorced applicants?", "When is a loan written off?"
+   - find_all_policy_mentions(terms): EXHAUSTIVE scan — returns EVERY section mentioning a category/label.
+     MANDATORY whenever the question names a policy-defined category (High Risk, Low Risk, Tier 1-4,
+     Prime, Sub-Prime, Watch, Substandard, guarantor, collateral, Credit Committee, minimum income...).
+     A category is often defined in SEVERAL sections (e.g. "High Risk" appears in §2.1, §4.1 and §8.1);
+     a single semantic search would miss some of them, which makes the answer INCOMPLETE and WRONG.
    Always cite the section numbers you relied on (e.g. "per policy §2.1").
    NEVER answer a policy question from memory — if you did not retrieve it, you do not know it.
 
 4. HYBRID → use when the question combines two or more tool types:
    a) DB + Calculator: "Average monthly payment for the top 10 loans at 5% for 10 years?"
       → query the DB for the loan amounts, then call calculate_monthly_payment.
-   b) POLICY + DB (the most valuable case): "How many clients fall into the policy's High Risk tier?"
-      → FIRST call search_credit_policy to get the official definition (Tier 4 = credit_score < 550),
-        THEN write the SQL using that exact threshold, and cite the section in the answer.
-      Other examples: "Which clients violate the minimum income rule?", "What share of the portfolio
-      is below the minimum employment duration?", "Is our default rate within the policy benchmark?"
+   b) POLICY + DB (the most valuable case) — see the mandatory workflow below.
+      Examples: "How many clients are High Risk per the policy?", "Which clients violate the minimum
+      income rule?", "Which clients are Prime / Tier 1?", "What share of the portfolio fails the
+      eligibility criteria?", "Is our default rate within the policy benchmark?"
    c) POLICY + Calculator: "Client earns 8,000/month and pays 3,600 — is that allowed?"
       → compute DTI, then retrieve the DTI thresholds and apply them.
 
+═══════════════════════════════════════════════
+MANDATORY WORKFLOW — POLICY-DEFINED CATEGORY APPLIED TO THE DATABASE
+═══════════════════════════════════════════════
+Trigger: the question asks to COUNT / LIST / MEASURE clients (or loans) using a label or category that
+the POLICY defines (High Risk, Low Risk, Tier N, Prime, Sub-Prime, eligible/ineligible, preferred
+applicant, policy violation, within/above a policy limit, etc.).
+
+STEP 1 — COLLECT ALL CRITERIA (never skip, never rely on a single section):
+   Call find_all_policy_mentions with the label and its synonyms (e.g. "high risk|tier 4").
+   Optionally add search_credit_policy for related wording. Build the COMPLETE list of criteria the
+   policy attaches to that label, each with its section number.
+
+STEP 2 — MAP EACH CRITERION TO THE DATABASE SCHEMA. For every criterion decide:
+   ✔ CHECKABLE  — it maps to a column: credit_score, loan_amount, age, default_status,
+                  employment_years, annual_income, marital_status.
+   ✘ NOT IN DATA — it needs information the DB does not hold: guarantors, collateral, Credit Committee
+                  review, approval rates, missed payments, DTI, interest rate, bankruptcy, documentation,
+                  income sources, loan term, outstanding balance, etc.
+   Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it);
+   "above 200,000" → loan_amount > 200000. Always state the exact operator you used.
+
+STEP 3 — RUN ONE SQL QUERY covering ALL checkable criteria, with a separate count per criterion,
+   a combined count (OR = meets ANY criterion), and the total, e.g.:
+   SELECT
+     SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)                 AS tier4_score_below_550,
+     SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)               AS employment_under_1_year,
+     SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 THEN 1 ELSE 0 END) AS high_risk_any,
+     SUM(CASE WHEN l.credit_score < 550 AND l.loan_amount > 50000 THEN 1 ELSE 0 END) AS tier4_above_50k_limit,
+     COUNT(*) AS total_clients
+   FROM loans l JOIN demographics d ON l.client_id = d.client_id;
+   When the policy sets a LIMIT for the category (max loan amount, max term...), also count the clients
+   in that category who EXCEED the limit — these are potential policy violations and are highly valuable.
+
+STEP 4 — ANSWER STRUCTURE (in the user's language):
+   1. "According to the policy, <label> is defined by:" — bullet per criterion WITH its section (§x.y).
+      Include ALL sections found, even those that cannot be checked in the data.
+   2. "What was checked in the data:" — the numbers per checkable criterion + combined count + total.
+   3. "⚠️ Data limitations:" — list every criterion that could NOT be checked and WHY (which information
+      is missing from the DB). State clearly that the result is therefore PARTIAL / a lower bound.
+   4. Any boundary assumptions you made (e.g. employment_years < 1).
+   Fill "policy_sources" with ALL sections used, and "data_coverage" with the checked / missing lists.
+   confidence_score: 70-89 (policy-based interpretation + partial data). tool_used: "hybrid".
+   NEVER present a single-criterion count as "the" answer when the policy lists several criteria.
+
+WORKED EXAMPLE — "How many clients in the portfolio are High Risk according to the policy?"
+   → find_all_policy_mentions("high risk|tier 4") returns §2.1 (Tier 4: score below 550, Credit Committee
+     review, max 50,000 ILS, two guarantors, <15% approval), §4.1 (0–1 years employment: high risk,
+     loans restricted below 30,000 ILS), §8.1 (Tier 4: up to 50,000 ILS with two guarantors + Committee).
+   → Checkable: credit_score < 550 (§2.1/§8.1); employment_years < 1 (§4.1); loan_amount vs the
+     50,000 / 30,000 limits (violation check). Not in data: guarantors, Credit Committee review,
+     approval rate.
+   → Run the SQL from STEP 3, then answer with the 4-part structure above.
+
 POLICY LOOKUP FOR VAGUE TERMS:
 When the user uses a vague qualifier (risky, high risk, young, experienced, large loan, good score, etc.),
-FIRST call search_credit_policy to check whether the policy defines it.
-- If the policy defines it → use that definition, state it explicitly in the answer with its section,
-  set confidence_score 70-89 (interpretation based on policy), and proceed.
+FIRST call find_all_policy_mentions / search_credit_policy to check whether the policy defines it.
+- If the policy defines it → use that definition (ALL its sections), state it explicitly in the answer,
+  set confidence_score 70-89 (interpretation based on policy), and follow the MANDATORY WORKFLOW above.
 - If the policy does NOT define it → fall back to the AMBIGUITY DETECTION rule below and ask.
 
 DATABASE SCHEMA — EXACT, COMPLETE:
@@ -252,11 +343,17 @@ Always return a valid JSON object with exactly these fields:
   "confidence_score": <integer 0-100>,
   "output_format": "<one of: text | table | sql | text+sql | table+sql | table+text+sql>",
   "table_data": [ {"column": value, ...}, ... ],
-  "policy_sources": [ "2.1 Credit Score Tiers", ... ]
+  "policy_sources": [ "2.1 Credit Score Tiers", ... ],
+  "data_coverage": {
+    "checked": [ "credit_score < 550 (§2.1)", ... ],
+    "missing": [ "Two guarantors required (§2.1) — guarantor data not in DB", ... ]
+  }
 }
 
-policy_sources: list the policy section labels (as returned by search_credit_policy in the "section" field)
-that you actually used in the answer. Empty list [] if the policy tool was not used.
+policy_sources: list the policy section labels (as returned by the policy tools in the "section" field)
+that you actually used in the answer. Empty list [] if no policy tool was used.
+data_coverage: ONLY for policy-applied-to-data questions — "checked" = criteria verified by SQL,
+"missing" = criteria that could not be verified and why. Otherwise {"checked": [], "missing": []}.
 
 OUTPUT FORMAT SELECTION RULES:
 - User asks for a table / טבלה → output_format "table", populate table_data
@@ -295,7 +392,7 @@ For POLICY questions, these concepts may be answered from the retrieved policy t
 If search_credit_policy returns nothing relevant → say the policy does not cover it (confidence_score=0). Do not invent rules.
 
 OUT-OF-DOMAIN (recipes, weather, stocks, coding, personal questions, DB modifications):
-{"answer": "⚠️ I'm a Credit Risk Assistant. I can only answer questions about the loan portfolio data, the credit underwriting policy, or perform financial calculations.", "sql_query": "", "tool_used": "none", "confidence_score": 0, "output_format": "text", "table_data": [], "policy_sources": []}"""
+{"answer": "⚠️ I'm a Credit Risk Assistant. I can only answer questions about the loan portfolio data, the credit underwriting policy, or perform financial calculations.", "sql_query": "", "tool_used": "none", "confidence_score": 0, "output_format": "text", "table_data": [], "policy_sources": [], "data_coverage": {"checked": [], "missing": []}}"""
 
 # ─────────────────────────────────────────────
 # LLM, TOOLS & AGENT
@@ -306,7 +403,7 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=openai_api_key)
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 sql_tools = toolkit.get_tools()
 calculator_tools = [calculate_monthly_payment, calculate_compound_interest, calculate_debt_to_income]
-policy_tools = [search_credit_policy]
+policy_tools = [search_credit_policy, find_all_policy_mentions]
 
 agent = create_agent(
     model=llm,
@@ -370,8 +467,7 @@ def confidence_badge(score: int) -> str:
         f'{label} confidence ({score}%)</span>'
     )
 
-def run_agent(query: str) -> dict:
-    result = agent.invoke({"messages": [("human", query)]})
+def parse_agent_output(result: dict) -> dict:
     messages = result.get("messages", [])
     raw = messages[-1].content if messages else ""
     try:
@@ -384,16 +480,73 @@ def run_agent(query: str) -> dict:
         data.setdefault("output_format", "text")
         data.setdefault("table_data", [])
         data.setdefault("policy_sources", [])
+        data.setdefault("data_coverage", {"checked": [], "missing": []})
         return data
     except (json.JSONDecodeError, AttributeError):
         return {
             "answer": raw or "לא התקבלה תשובה מהסוכן.",
             "sql_query": "", "tool_used": "database",
             "confidence_score": 50, "output_format": "text", "table_data": [],
-            "policy_sources": []
+            "policy_sources": [], "data_coverage": {"checked": [], "missing": []}
         }
 
+MAX_COMPLETENESS_RETRIES = 1  # one automatic correction round if the answer is incomplete
+
+def run_agent(query: str) -> dict:
+    """
+    Run the agent. If the question mentions a policy-defined category (High Risk, Tier 4, Prime...):
+      1. inject ALL the policy sections for that category into the agent's input,
+      2. validate the answer (every section cited, every checkable column in the SQL),
+      3. retry once with a correction message if something is missing.
+    The verdict is attached under data["_completeness"] and surfaced in the UI.
+    """
+    categories = detect_policy_categories(query, policy_chunks)
+    enforce_sql = wants_data(query)
+
+    agent_input = query + build_policy_context(categories, enforce_sql) if categories else query
+    result = agent.invoke({"messages": [("human", agent_input)]})
+    data = parse_agent_output(result)
+
+    if not categories:
+        return data
+
+    retries = 0
+    report = check_completeness(data, categories, enforce_sql)
+    while not report["ok"] and retries < MAX_COMPLETENESS_RETRIES:
+        retries += 1
+        result = agent.invoke({"messages": result["messages"] + [("human", build_correction(report))]})
+        data = parse_agent_output(result)
+        report = check_completeness(data, categories, enforce_sql)
+
+    data["_completeness"] = {
+        "categories": [c["label"] for c in categories],
+        "retries": retries,
+        **report,
+    }
+    return data
+
 CONFIDENCE_THRESHOLD = 70  # מתחת לסף זה → לא מציגים תשובה, רק בקשת הבהרה
+
+def render_completeness(comp):
+    """Show the verdict of the Python-level policy completeness check (if the question triggered it)."""
+    if not comp:
+        return
+    cats = ", ".join(comp.get("categories", []))
+    secs = ", ".join("§" + s for s in comp.get("expected_sections", []))
+    if comp.get("missing_sections") or comp.get("missing_columns"):
+        parts = []
+        if comp.get("missing_sections"):
+            parts.append("policy sections not covered: " + ", ".join("§" + s for s in comp["missing_sections"]))
+        if comp.get("missing_columns"):
+            parts.append("criteria not checked in SQL: " + ", ".join(comp["missing_columns"]))
+        st.warning(
+            f"⚠️ **Completeness check failed — treat this answer as PARTIAL.** "
+            f"The policy defines *{cats}* in {secs}. " + "; ".join(parts) + "."
+        )
+    elif comp.get("retries"):
+        st.caption(f"🔁 Answer regenerated after an automatic completeness check — now covers {secs} for *{cats}*.")
+    else:
+        st.caption(f"✅ Completeness check passed — covers {secs} for *{cats}*.")
 
 def render_response(data: dict):
     fmt          = data.get("output_format", "text")
@@ -403,6 +556,10 @@ def render_response(data: dict):
     table_data   = data.get("table_data", [])
     tool_used    = data.get("tool_used", "database")
     sources      = data.get("policy_sources", []) or []
+    coverage     = data.get("data_coverage") or {}
+    checked      = coverage.get("checked", []) or [] if isinstance(coverage, dict) else []
+    missing      = coverage.get("missing", []) or [] if isinstance(coverage, dict) else []
+    comp         = data.get("_completeness")
 
     # ── PYTHON-LEVEL ENFORCEMENT: confidence < threshold ──────────────────
     # גם אם הסוכן "שכח" לבקש הבהרה בפרומפט — הקוד מאכף
@@ -416,6 +573,7 @@ def render_response(data: dict):
             )
         else:
             st.warning(f"⚠️ **Confidence too low to answer ({confidence}%).**\n\n{body}")
+        render_completeness(comp)
         # Confidence badge בלבד — ללא תוצאה, ללא SQL
         st.markdown(confidence_badge(confidence), unsafe_allow_html=True)
         st.progress(confidence / 100)
@@ -442,6 +600,8 @@ def render_response(data: dict):
         elif answer:
             rtl_markdown(answer)
 
+    render_completeness(comp)
+
     # Badges row
     badges_html = tool_badge(tool_used) + "&nbsp;&nbsp;" + confidence_badge(confidence)
     st.markdown(badges_html, unsafe_allow_html=True)
@@ -457,6 +617,16 @@ def render_response(data: dict):
         with st.expander(f"📜 Policy sources ({len(sources)})"):
             for s in sources:
                 st.markdown(f"- §{s}")
+
+    # Data coverage expander — what was verified in the DB vs. what the data cannot answer
+    if checked or missing:
+        with st.expander(f"📊 Data coverage — checked: {len(checked)} · missing: {len(missing)}", expanded=bool(missing)):
+            if checked:
+                st.markdown("**✔ Checked against the database:**")
+                rtl_markdown("\n".join(f"- {c}" for c in checked))
+            if missing:
+                st.markdown("**✘ Not available in the database (partial answer):**")
+                rtl_markdown("\n".join(f"- {m}" for m in missing))
 
 # ─────────────────────────────────────────────
 # UI
