@@ -180,7 +180,12 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
         "3. Under 'Data limitations', list every criterion that cannot be checked in the data and why "
         "(guarantors, Credit Committee review, approval rates, collateral, DTI, missed payments... are NOT in the DB).\n"
         "4. Set policy_sources to ALL the sections above and fill data_coverage (checked / missing).\n"
-        "An answer based on a single section or a single threshold is INCOMPLETE and will be rejected."
+        "5. EVERY section number listed above must appear EXPLICITLY in the answer text (not only in "
+        "policy_sources). If two sections state the same rule (e.g. 2.1 and 8.1 both give the 50,000 ILS "
+        "limit for Tier 4), cite BOTH, e.g. 'סעיפים 2.1 ו-8.1' / 'Sections 2.1 and 8.1'. Do not merge or "
+        "drop a section because it looks redundant.\n"
+        "An answer that omits any of these sections, or that is based on a single threshold, is INCOMPLETE "
+        "and will be rejected."
     )
 
 
@@ -190,16 +195,19 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
 
 def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) -> dict:
     """Which expected sections / SQL columns are missing from the agent's JSON answer."""
-    cited = set()
+    # (a) sections listed in policy_sources
+    in_sources = set()
     for s in data.get("policy_sources", []) or []:
         m = re.match(r"\s*(?:§|section|סעיף)?\s*(\d+\.\d+)", str(s), flags=re.IGNORECASE)
         if m:
-            cited.add(m.group(1))
+            in_sources.add(m.group(1))
+    # (b) sections cited IN THE ANSWER TEXT — this is what the user actually reads, so it is the real gate.
+    #     policy_sources alone is NOT enough (the model used to list a section there and omit it from the text).
     answer_text = str(data.get("answer", "") or "")
-    cited.update(re.findall(r"(?:§|section|סעיף)\s*(\d+\.\d+)", answer_text, flags=re.IGNORECASE))
-    # plural lists: "סעיפים 2.1, 4.1 ו-8.1" / "Sections 2.1, 4.1 and 8.1"
-    for lst in re.findall(r"(?:sections|סעיפים)\s*((?:\d+\.\d+[\s,]*(?:and|ו-|ו)?\s*)+)", answer_text, flags=re.IGNORECASE):
-        cited.update(re.findall(r"\d+\.\d+", lst))
+    in_answer = set(re.findall(r"(?:§|section|סעיף)\s*(\d+\.\d+)", answer_text, flags=re.IGNORECASE))
+    # plural lists: "סעיפים 2.1, 4.1 ו-8.1" / "Sections 2.1, 4.1 and 8.1" / "Sections 2.1/8.1"
+    for lst in re.findall(r"(?:sections|סעיפים)\s*((?:\d+\.\d+[\s,/]*(?:and|ו-|ו)?\s*)+)", answer_text, flags=re.IGNORECASE):
+        in_answer.update(re.findall(r"\d+\.\d+", lst))
 
     sql = (data.get("sql_query") or "").lower()
     expected_sections, expected_columns = [], []
@@ -207,21 +215,28 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
         expected_sections += [s for s in c["section_ids"] if s not in expected_sections]
         expected_columns += [col for col in c["columns"] if col not in expected_columns]
 
-    missing_sections = [s for s in expected_sections if s not in cited]
+    missing_sections = [s for s in expected_sections if s not in in_answer]
+    missing_in_sources = [s for s in expected_sections if s not in in_sources]
     missing_columns = [c for c in expected_columns if c not in sql] if (enforce_sql or sql) else []
     return {
         "expected_sections": expected_sections,
         "expected_columns": expected_columns,
-        "missing_sections": missing_sections,
+        "missing_sections": missing_sections,          # not mentioned in the answer text
+        "missing_in_sources": missing_in_sources,      # not listed in policy_sources
         "missing_columns": missing_columns,
-        "ok": not missing_sections and not missing_columns,
+        "ok": not missing_sections and not missing_in_sources and not missing_columns,
     }
 
 
 def build_correction(report: dict) -> str:
     msg = "Your previous answer is INCOMPLETE and was REJECTED by an automatic completeness check.\n"
     if report["missing_sections"]:
-        msg += "- Policy sections you did not cover: " + ", ".join("Section " + s for s in report["missing_sections"]) + "\n"
+        msg += ("- Policy sections NOT mentioned in your answer text: "
+                + ", ".join("Section " + s for s in report["missing_sections"])
+                + ". Each of them must appear explicitly in the answer (its number AND what it says), "
+                  "even if it repeats a rule already stated in another section.\n")
+    if report.get("missing_in_sources"):
+        msg += "- Sections missing from policy_sources: " + ", ".join(report["missing_in_sources"]) + "\n"
     if report["missing_columns"]:
         msg += "- DB columns your SQL did not check: " + ", ".join(report["missing_columns"]) + "\n"
     msg += (

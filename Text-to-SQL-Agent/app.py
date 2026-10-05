@@ -312,7 +312,9 @@ STEP 3 — SEPARATE "CLASSIFICATION CRITERIA" FROM "LIMITS", THEN RUN ONE SQL QU
 
 STEP 4 — ANSWER STRUCTURE (in the user's language):
    1. "According to the policy, <label> is defined by:" — bullet per criterion WITH its section number
-      ("סעיף 2.1" / "Section 2.1"). Include ALL sections found, even those that cannot be checked in the data.
+      ("סעיף 2.1" / "Section 2.1"). Include ALL sections found, even those that cannot be checked in the data,
+      and even when a section repeats a rule from another section — then cite both ("סעיפים 2.1 ו-8.1").
+      Every section number must appear in the answer TEXT, not only in policy_sources.
    2. "What was checked in the data:" — one line per classification criterion, then EXACTLY this line:
          Hebrew:  "לקוחות שעומדים בלפחות קריטריון אחד: <n>"
          English: "Clients meeting at least one criterion: <n>"
@@ -568,12 +570,14 @@ def render_completeness(comp):
         return
     cats = ", ".join(comp.get("categories", []))
     secs = "Sections " + ", ".join(comp.get("expected_sections", []))
-    if comp.get("missing_sections") or comp.get("missing_columns"):
+    if comp.get("missing_sections") or comp.get("missing_columns") or comp.get("missing_in_sources"):
         parts = []
         if comp.get("missing_sections"):
             parts.append("policy sections not covered: " + ", ".join(comp["missing_sections"]))
         if comp.get("missing_columns"):
             parts.append("criteria not checked in SQL: " + ", ".join(comp["missing_columns"]))
+        if comp.get("missing_in_sources") and not comp.get("missing_sections"):
+            parts.append("sections missing from the sources list: " + ", ".join(comp["missing_in_sources"]))
         st.warning(
             f"⚠️ **Completeness check failed — treat this answer as PARTIAL.** "
             f"The policy defines *{cats}* in {secs}. " + "; ".join(parts) + "."
