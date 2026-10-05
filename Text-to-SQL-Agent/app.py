@@ -306,26 +306,38 @@ STEP 3 — SEPARATE "CLASSIFICATION CRITERIA" FROM "LIMITS", THEN RUN ONE SQL QU
      SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)                              AS employment_under_1_year,
      SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 THEN 1 ELSE 0 END)      AS at_least_one_criterion,
      SUM(CASE WHEN l.credit_score < 550 AND l.loan_amount > 50000 THEN 1 ELSE 0 END)      AS tier4_above_50k_limit,
-     SUM(CASE WHEN d.employment_years < 1 AND l.loan_amount >= 30000 THEN 1 ELSE 0 END)   AS new_employee_above_30k_limit,
      COUNT(*) AS total_clients
    FROM loans l JOIN demographics d ON l.client_id = d.client_id;
 
-STEP 4 — ANSWER STRUCTURE (in the user's language):
-   1. "According to the policy, <label> is defined by:" — bullet per criterion WITH its section number
-      ("סעיף 2.1" / "Section 2.1"). Include ALL sections found, even those that cannot be checked in the data,
-      and even when a section repeats a rule from another section — then cite both ("סעיפים 2.1 ו-8.1").
-      Every section number must appear in the answer TEXT, not only in policy_sources.
-   2. "What was checked in the data:" — one line per classification criterion, then EXACTLY this line:
-         Hebrew:  "לקוחות שעומדים בלפחות קריטריון אחד: <n>"
-         English: "Clients meeting at least one criterion: <n>"
-      then the limit-violation lines, labelled as violations among the category members, e.g.
-         "לקוחות עם ציון מתחת ל-550 שההלוואה שלהם מעל תקרת 50,000 ש"ח (חריגה ממדיניות): <n>"
-      and finally the total.
-   3. "⚠️ Data limitations:" — list every criterion that could NOT be checked and WHY (which information
-      is missing from the DB). State clearly that the result is therefore PARTIAL / a lower bound.
-   4. Any boundary assumptions you made (e.g. employment_years < 1).
-   Fill "policy_sources" with ALL sections used, and "data_coverage" with the checked / missing lists.
-   confidence_score: 70-89 (policy-based interpretation + partial data). tool_used: "hybrid".
+STEP 4 — ANSWER STRUCTURE (STRICT — the UI renders these fields in a fixed layout):
+
+   "answer" = PART 1 ONLY — the policy definition:
+      Hebrew:  "לפי המדיניות, לקוחות בקטגוריית <label> מוגדרים על פי:"
+      English: "According to the policy, <label> clients are defined by:"
+      followed by ONE bullet PER SECTION found, in section order. Each bullet = a short description of what
+      that section says about the category, ending with the section number in parentheses:
+         * ציון אשראי מתחת ל-550 (סעיף 2.1).
+         * 0–1 שנות תעסוקה (סעיף 4.1).
+         * סכום הלוואה מעל 50,000 ש"ח (סעיף 8.1).
+      NOTHING ELSE in "answer": no numbers, no counts, no table, no limitations. (If you made a boundary
+      assumption, add ONE short final line: "הנחה: ..." / "Assumption: ...".)
+
+   "table_data" = PART 2 — "what was checked in the data", one row per line, as
+      {"מדד": "<label>", "ערך": <number>}  (English: {"Metric": ..., "Value": ...}), in THIS order:
+      1. one row per section bullet above, in the same order:
+         - classification criterion → its count:          "לקוחות עם ציון מתחת ל-550" → 28
+                                                           "לקוחות עם 0–1 שנות תעסוקה" → 4
+         - limit section → violations among the category:  "לקוחות עם ציון מתחת ל-550 שההלוואה שלהם מעל תקרת 50,000 ש"ח (חריגה ממדיניות)" → 26
+      2. "לקוחות שעומדים בלפחות קריטריון אחד" / "Clients meeting at least one criterion" → OR over the
+         classification criteria ONLY (never a limit column).
+      3. "סך כל הלקוחות" / "Total clients".
+   output_format = "table+text"  (append "+sql" when the user asked for the query).
+
+   "data_coverage.checked" = the criteria/limits you verified, each with its section.
+   "data_coverage.missing" = PART 3 — every criterion that could NOT be verified and WHY (guarantors,
+      Credit Committee review, approval rate, collateral, DTI, missed payments... are not in the DB).
+      The UI shows this list under the table as "data limitations" — do not repeat it in "answer".
+   "policy_sources" = ALL sections found.  confidence_score: 70-89.  tool_used: "hybrid".
    NEVER present a single-criterion count as "the" answer when the policy lists several criteria.
 
 WORKED EXAMPLE — "How many clients in the portfolio are High Risk according to the policy?"
@@ -564,6 +576,48 @@ def strip_section_sign(data: dict) -> dict:
             cov[k] = [re.sub(r"§\s*", word, str(x)) for x in cov.get(k, []) or []]
     return data
 
+COMBINED_ROW_RE = re.compile(r"לפחות קריטריון|at least one", re.IGNORECASE)
+TOTAL_ROW_RE    = re.compile(r"סך|סה\"כ|total", re.IGNORECASE)
+
+def order_policy_rows(rows: list) -> list:
+    """Enforce the fixed order: per-section rows → 'at least one criterion' → total (stable sort)."""
+    def rank(r):
+        label = str(next(iter(r.values()), "")) if isinstance(r, dict) and r else ""
+        if TOTAL_ROW_RE.search(label):
+            return 2
+        if COMBINED_ROW_RE.search(label):
+            return 1
+        return 0
+    return sorted(rows, key=rank)
+
+def markdown_table(rows: list) -> str:
+    cols = list(rows[0].keys())
+    esc = lambda v: str(v).replace("|", "/")
+    lines = ["| " + " | ".join(esc(c) for c in cols) + " |", "|" + "---|" * len(cols)]
+    lines += ["| " + " | ".join(esc(r.get(c, "")) for c in cols) + " |" for r in rows]
+    return "\n".join(lines)
+
+def render_policy_answer(answer: str, table_data: list, missing: list):
+    """Fixed layout for policy-category answers: definition → 'checked in the data' table → limitations."""
+    hebrew = is_hebrew(answer) or any(is_hebrew(str(v)) for r in table_data if isinstance(r, dict) for v in r.values())
+    rtl_markdown(answer)
+
+    rows = order_policy_rows([r for r in table_data if isinstance(r, dict) and r])
+    if rows:
+        header = "**מה שנבדק בנתונים:**" if hebrew else "**What was checked in the data:**"
+        if hebrew:
+            rtl_markdown(header + "\n\n" + markdown_table(rows))
+        else:
+            st.markdown(header)
+            try:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            except Exception:
+                st.write(rows)
+
+    if missing:
+        title = "**⚠️ מגבלות הנתונים (התשובה חלקית):**" if hebrew else "**⚠️ Data limitations (partial answer):**"
+        rtl_markdown(title + "\n\n" + "\n".join(f"- {m}" for m in missing))
+
 def render_completeness(comp):
     """Show the verdict of the Python-level policy completeness check (if the question triggered it)."""
     if not comp:
@@ -625,19 +679,25 @@ def render_response(data: dict):
 
     # ── confidence ≥ threshold: מציגים תשובה מלאה ───────────────────────
 
-    # תשובה מילולית
-    if answer and ("text" in fmt or "table" not in fmt):
-        rtl_markdown(answer)
+    is_policy_answer = bool(comp) and bool(table_data)
 
-    # טבלה
-    if "table" in fmt:
-        if table_data:
-            try:
-                st.dataframe(pd.DataFrame(table_data), use_container_width=True)
-            except Exception:
-                st.write(table_data)
-        elif answer:
+    if is_policy_answer:
+        # Fixed layout: 1) policy definition  2) "checked in the data" table  3) data limitations
+        render_policy_answer(answer, table_data, missing)
+    else:
+        # תשובה מילולית
+        if answer and ("text" in fmt or "table" not in fmt):
             rtl_markdown(answer)
+
+        # טבלה
+        if "table" in fmt:
+            if table_data:
+                try:
+                    st.dataframe(pd.DataFrame(table_data), use_container_width=True)
+                except Exception:
+                    st.write(table_data)
+            elif answer:
+                rtl_markdown(answer)
 
     render_completeness(comp)
 
@@ -658,14 +718,16 @@ def render_response(data: dict):
                 rtl_markdown(f"- {section_label(s, hebrew=is_hebrew(answer))}")
 
     # Data coverage expander — what was verified in the DB vs. what the data cannot answer
-    if checked or missing:
-        with st.expander(f"📊 Data coverage — checked: {len(checked)} · missing: {len(missing)}", expanded=bool(missing)):
+    # (for policy answers the "missing" part is already shown inline under the table)
+    show_missing = [] if is_policy_answer else missing
+    if checked or show_missing:
+        with st.expander(f"📊 Data coverage — checked: {len(checked)} · missing: {len(missing)}", expanded=bool(show_missing)):
             if checked:
                 st.markdown("**✔ Checked against the database:**")
                 rtl_markdown("\n".join(f"- {c}" for c in checked))
-            if missing:
+            if show_missing:
                 st.markdown("**✘ Not available in the database (partial answer):**")
-                rtl_markdown("\n".join(f"- {m}" for m in missing))
+                rtl_markdown("\n".join(f"- {m}" for m in show_missing))
 
 # ─────────────────────────────────────────────
 # UI

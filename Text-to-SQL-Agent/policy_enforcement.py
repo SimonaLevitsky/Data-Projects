@@ -155,35 +155,41 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
             + f"\n  DB columns that can verify criteria from these sections: {cols}."
         )
 
-    sql_req = (
-        "2. Separate CLASSIFICATION criteria (score / employment / income / age thresholds that make a client "
-        "belong to the category) from LIMITS (max loan amount, guarantors, committee review — rules for clients "
-        "already in the category). Run ONE SQL query with: a count per classification criterion; ONE combined "
-        "count of clients meeting AT LEAST ONE classification criterion (OR over the classification criteria "
-        "ONLY — never put a loan-amount limit inside this OR); for each checkable limit, the number of "
-        "violations counted ONLY among clients who meet the matching classification criterion "
-        "(e.g. credit_score < 550 AND loan_amount > 50000); and the total.\n"
-        "   Label the combined line EXACTLY: Hebrew \"לקוחות שעומדים בלפחות קריטריון אחד: <n>\" / "
-        "English \"Clients meeting at least one criterion: <n>\".\n"
-        if enforce_sql else
-        "2. If you query the database, check EVERY criterion that maps to the DB columns listed above.\n"
-    )
+    if enforce_sql:
+        data_req = (
+            "2. Separate CLASSIFICATION criteria (score / employment / income / age thresholds that make a client "
+            "belong to the category) from LIMITS (max loan amount, guarantors, committee review — rules for clients "
+            "already in the category). Run ONE SQL query with: a count per classification criterion; ONE combined "
+            "count of clients meeting AT LEAST ONE classification criterion (OR over the classification criteria "
+            "ONLY — never put a loan-amount limit inside this OR); for each checkable limit, the violations counted "
+            "ONLY among clients who meet the matching classification criterion (e.g. credit_score < 550 AND "
+            "loan_amount > 50000); and the total.\n"
+            "3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {\"מדד\": label, \"ערך\": n} "
+            "(English: Metric / Value), in THIS order: one row per section bullet (criterion → count; limit → "
+            "violations among the category), then EXACTLY \"לקוחות שעומדים בלפחות קריטריון אחד\" / "
+            "\"Clients meeting at least one criterion\", then \"סך כל הלקוחות\" / \"Total clients\". "
+            "Set output_format to \"table+text\" (+sql if the user asked for the query).\n"
+        )
+    else:
+        data_req = "2. If you query the database, check EVERY criterion that maps to the DB columns listed above.\n3. (no table needed)\n"
+
     return (
         "\n\n[POLICY CONTEXT — injected automatically by the system. This is the COMPLETE list of policy "
         "sections for the category in the question; you do not need to call find_all_policy_mentions again.]\n"
         + "\n\n".join(parts)
         + "\n\nREQUIREMENTS FOR YOUR ANSWER (MANDATORY WORKFLOW):\n"
-        "1. List EVERY criterion from EVERY section above, each with its exact section number. "
-        "Use ONLY the section numbers given here. NEVER write the '§' sign — write the word: "
-        "Hebrew 'סעיף 2.1', English 'Section 2.1'.\n"
-        + sql_req +
-        "3. Under 'Data limitations', list every criterion that cannot be checked in the data and why "
-        "(guarantors, Credit Committee review, approval rates, collateral, DTI, missed payments... are NOT in the DB).\n"
-        "4. Set policy_sources to ALL the sections above and fill data_coverage (checked / missing).\n"
-        "5. EVERY section number listed above must appear EXPLICITLY in the answer text (not only in "
-        "policy_sources). If two sections state the same rule (e.g. 2.1 and 8.1 both give the 50,000 ILS "
-        "limit for Tier 4), cite BOTH, e.g. 'סעיפים 2.1 ו-8.1' / 'Sections 2.1 and 8.1'. Do not merge or "
-        "drop a section because it looks redundant.\n"
+        "1. \"answer\" = the policy definition ONLY: the header line (\"לפי המדיניות, לקוחות בקטגוריית <label> "
+        "מוגדרים על פי:\" / \"According to the policy, <label> clients are defined by:\") followed by ONE bullet "
+        "PER SECTION listed above, in section order, each ending with its section number — written as the word, "
+        "NEVER the '§' sign: Hebrew '(סעיף 2.1)', English '(Section 2.1)'. Use ONLY the section numbers given here. "
+        "No numbers/counts/limitations inside \"answer\".\n"
+        + data_req +
+        "4. \"data_coverage.missing\" = every criterion that cannot be checked in the data and why (guarantors, "
+        "Credit Committee review, approval rates, collateral, DTI, missed payments... are NOT in the DB); "
+        "\"data_coverage.checked\" = what you verified, with sections. The UI shows them under the table.\n"
+        "5. \"policy_sources\" = ALL the sections above. EVERY section number must appear EXPLICITLY in the "
+        "\"answer\" text as its own bullet. If two sections state the same rule (e.g. 2.1 and 8.1 both give the "
+        "50,000 ILS limit for Tier 4), keep BOTH bullets — do not merge or drop a section because it looks redundant.\n"
         "An answer that omits any of these sections, or that is based on a single threshold, is INCOMPLETE "
         "and will be rejected."
     )
