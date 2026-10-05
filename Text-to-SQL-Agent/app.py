@@ -323,85 +323,68 @@ Trigger: the question asks to COUNT / LIST / MEASURE clients (or loans) using a 
 the POLICY defines (High Risk, Low Risk, Tier N, Prime, Sub-Prime, eligible/ineligible, preferred
 applicant, policy violation, within/above a policy limit, etc.).
 
-STEP 1 — COLLECT ALL CRITERIA (never skip, never rely on a single section):
+STEP 1 — COLLECT EVERY SECTION (never rely on a single section):
    Call find_all_policy_mentions with the label and its synonyms (e.g. "high risk|tier 4").
-   Optionally add search_credit_policy for related wording. Build the COMPLETE list of criteria the
-   policy attaches to that label, each with its section number.
+   A category is usually mentioned in SEVERAL sections.
 
-STEP 2 — MAP EACH CRITERION TO THE DATABASE SCHEMA. For every criterion decide:
-   ✔ CHECKABLE  — it maps to a column: credit_score, loan_amount, age, default_status,
-                  employment_years, annual_income, marital_status.
-   ✘ NOT IN DATA — it needs information the DB does not hold: guarantors, collateral, Credit Committee
-                  review, approval rates, missed payments, DTI, interest rate, bankruptcy, documentation,
-                  income sources, loan term, outstanding balance, etc.
-   Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it);
-   "above 200,000" → loan_amount > 200000. Always state the exact operator you used.
+STEP 2 — SPLIT THE SECTIONS INTO CRITERIA vs LIMITS:
+   ✔ CRITERION section = states WHO belongs to the category: a threshold on credit score, employment
+     years, income, age, DTI, missed payments, default status, marital status.
+     e.g. Section 2.1 "Tier 4 — High Risk (Score below 550)", Section 4.1 "0–1 years of employment: High risk".
+   ✘ LIMIT section = states what applies to clients who are ALREADY in the category: maximum loan amount,
+     guarantors, collateral, Credit Committee review, approval rate, max term.
+     e.g. Section 8.1 "Tier 4 (High Risk): Up to 50,000 ILS with two guarantors".
+   A question like "how many clients are <category>?" asks for the CRITERIA. LIMIT sections are NOT part
+   of the answer: do not mention them, do not count them, do not list them in policy_sources.
+   (A line that contains both a threshold and limits — like Section 2.1 — is a CRITERION section; use its
+   threshold and ignore its limits.)
 
-STEP 3 — ONE CONDITION PER SECTION, EACH COUNTED SEPARATELY OVER THE WHOLE PORTFOLIO.
-   Every section found in STEP 1 contributes ONE condition: the numeric threshold that section attaches to
-   the category (score range, employment duration, loan amount, income, age...). Each condition is
-   STANDALONE — it is checked against ALL clients, not only against clients who meet another condition.
-   Do NOT combine conditions with AND, do NOT nest a limit inside another criterion, do NOT add secondary
-   thresholds from the same section (one condition per section only).
-   Example — High Risk: Section 2.1 → credit_score < 550; Section 4.1 → employment_years < 1;
-             Section 8.1 → loan_amount > 50000.
-   Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it);
-   "up to 50,000" → loan_amount > 50000 counts the clients above it.
-   Run ONE SQL query with: one count per condition, ONE combined count = clients meeting AT LEAST ONE
-   of the conditions (OR over ALL of them), and the total:
+STEP 3 — ONE CONDITION PER CRITERION SECTION, EACH COUNTED OVER THE WHOLE PORTFOLIO:
+   Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it).
+   Run ONE SQL query with: one count per criterion, ONE combined count = clients meeting AT LEAST ONE
+   criterion (OR over the criteria), and the total:
    SELECT
-     SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)        AS score_below_550,
-     SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)      AS employment_under_1_year,
-     SUM(CASE WHEN l.loan_amount > 50000 THEN 1 ELSE 0 END)       AS loan_above_50k,
-     SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 OR l.loan_amount > 50000
-              THEN 1 ELSE 0 END)                                  AS at_least_one_condition,
+     SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)                           AS score_below_550,
+     SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)                         AS employment_under_1_year,
+     SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 THEN 1 ELSE 0 END) AS at_least_one_criterion,
      COUNT(*) AS total_clients
    FROM loans l JOIN demographics d ON l.client_id = d.client_id;
-   This rule is GENERAL: whenever a question involves several conditions, report each condition
-   separately, then "at least one condition", then the total.
+   This rule is GENERAL: whenever a question involves several criteria, report each criterion separately,
+   then "at least one criterion", then the total. Never add AND-combinations or limit columns.
 
 STEP 4 — ANSWER STRUCTURE (STRICT — the UI renders these fields in a fixed layout):
 
    "answer" = PART 1 ONLY — the policy definition:
       Hebrew:  "לפי המדיניות, לקוחות בקטגוריית <label> מוגדרים על פי:"
       English: "According to the policy, <label> clients are defined by:"
-      followed by ONE bullet PER SECTION found, in section order. Each bullet = the section's condition,
-      ending with the section number in parentheses:
+      followed by ONE bullet PER CRITERION SECTION, in section order, ending with the section number:
          * ציון אשראי מתחת ל-550 (סעיף 2.1).
          * 0–1 שנות תעסוקה (סעיף 4.1).
-         * סכום הלוואה מעל 50,000 ש"ח (סעיף 8.1).
-      NOTHING ELSE in "answer": no numbers, no counts, no table, no limitations. (If you made a boundary
-      assumption, add ONE short final line: "הנחה: ..." / "Assumption: ...".)
+      NOTHING ELSE in "answer": no numbers, no counts, no limits. (If you made a boundary assumption,
+      add ONE short final line: "הנחה: ..." / "Assumption: ...".)
 
-   "table_data" = PART 2 — "what was checked in the data", one row per line, as
-      {"מדד": "<label>", "ערך": <number>}  (English: {"Metric": ..., "Value": ...}), in THIS order:
-      1. one row per condition, same order as the bullets, each counted over the WHOLE portfolio:
-            "לקוחות עם ציון מתחת ל-550"                    → 28
-            "לקוחות עם 0–1 שנות תעסוקה"                    → 4
-            "לקוחות שההלוואה שלהם מעל תקרת 50,000 ש"ח"     → <count of loan_amount > 50000>
-      2. "לקוחות שעומדים בלפחות קריטריון אחד" / "Clients meeting at least one criterion"
-         → OR over ALL the conditions above.
+   "table_data" = PART 2 — "what was checked in the data", rows {"מדד": "<label>", "ערך": <number>}
+      (English: {"Metric": ..., "Value": ...}), in THIS order:
+      1. one row per criterion, same order as the bullets:   "לקוחות עם ציון מתחת ל-550" → 28
+                                                              "לקוחות עם 0–1 שנות תעסוקה" → 4
+      2. "לקוחות שעומדים בלפחות קריטריון אחד" / "Clients meeting at least one criterion" → OR over the criteria
       3. "סך כל הלקוחות" / "Total clients".
-      Exactly these rows — no extra rows (no AND-combinations, no secondary limits).
+      Exactly these rows — no extra rows.
    output_format = "table+text"  (append "+sql" when the user asked for the query).
 
-   "data_coverage.checked" = the conditions you verified, each with its section.
-   "data_coverage.missing" = PART 3 — every policy requirement that could NOT be verified and WHY
-      (guarantors, Credit Committee review, approval rate, collateral, DTI, missed payments... are not in
-      the DB). The UI shows this list under the table as "data limitations" — do not repeat it in "answer".
-   "policy_sources" = ALL sections found.  confidence_score: 70-89.  tool_used: "hybrid".
-   NEVER present a single-condition count as "the" answer when the policy lists several conditions.
+   "data_coverage.checked" = the criteria you verified, each with its section.
+   "data_coverage.missing" = ONLY criteria that cannot be verified in the data (e.g. DTI, missed payments).
+      Leave it EMPTY when every criterion was verified. Never put limits (guarantors, amounts, committee) there.
+   "policy_sources" = exactly the criterion sections.  confidence_score: 70-89.  tool_used: "hybrid".
+   NEVER present a single-criterion count as "the" answer when the policy lists several criteria.
 
 WORKED EXAMPLE — "How many clients in the portfolio are High Risk according to the policy?"
-   → find_all_policy_mentions("high risk|tier 4") returns Section 2.1 (Tier 4: score below 550, Credit
-     Committee review, max 50,000 ILS, two guarantors, <15% approval), Section 4.1 (0–1 years employment:
-     high risk, loans restricted below 30,000 ILS), Section 8.1 (Tier 4: up to 50,000 ILS with two
-     guarantors + Committee).
-   → Conditions (one per section, each over the whole portfolio): credit_score < 550 (Section 2.1);
-     employment_years < 1 (Section 4.1); loan_amount > 50000 (Section 8.1).
-     Not in data: guarantors, Credit Committee review, approval rate.
-   → Run the SQL from STEP 3; "answer" = the 3 bullets; "table_data" = 3 condition rows + "at least one
-     criterion" + total; "data_coverage.missing" = the unverifiable requirements.
+   → find_all_policy_mentions("high risk|tier 4") returns Section 2.1 (Tier 4: score below 550 + limits),
+     Section 4.1 (0–1 years employment: high risk + a 30,000 ILS restriction), Section 8.1 (Tier 4 limits only).
+   → Criteria: credit_score < 550 (Section 2.1); employment_years < 1 (Section 4.1).
+     Section 8.1 is a LIMIT section → excluded from the answer entirely.
+   → Run the SQL from STEP 3; "answer" = 2 bullets; "table_data" = 2 criterion rows + "at least one
+     criterion" + total; data_coverage.missing = [] (both criteria verified).
 
 POLICY LOOKUP FOR VAGUE TERMS:
 When the user uses a vague qualifier (risky, high risk, young, experienced, large loan, good score, etc.),
@@ -696,7 +679,7 @@ def render_policy_answer(answer: str, table_data: list, missing: list):
                 st.write(rows)
 
     if missing:
-        title = "**⚠️ מגבלות הנתונים (התשובה חלקית):**" if hebrew else "**⚠️ Data limitations (partial answer):**"
+        title = "**⚠️ קריטריונים שלא ניתן לבדוק בנתונים:**" if hebrew else "**⚠️ Criteria that cannot be verified in the data:**"
         rtl_markdown(title + "\n\n" + "\n".join(f"- {m}" for m in missing))
 
 def render_completeness(comp):
@@ -705,7 +688,7 @@ def render_completeness(comp):
         return
     cats = ", ".join(comp.get("categories", []))
     secs = "Sections " + ", ".join(comp.get("expected_sections", []))
-    if comp.get("missing_sections") or comp.get("missing_columns") or comp.get("missing_in_sources"):
+    if comp.get("missing_sections") or comp.get("missing_columns") or comp.get("missing_in_sources") or comp.get("unexpected_sections"):
         parts = []
         if comp.get("missing_sections"):
             parts.append("policy sections not covered: " + ", ".join(comp["missing_sections"]))
@@ -713,6 +696,8 @@ def render_completeness(comp):
             parts.append("criteria not checked in SQL: " + ", ".join(comp["missing_columns"]))
         if comp.get("missing_in_sources") and not comp.get("missing_sections"):
             parts.append("sections missing from the sources list: " + ", ".join(comp["missing_in_sources"]))
+        if comp.get("unexpected_sections"):
+            parts.append("limit-only sections wrongly included: " + ", ".join(comp["unexpected_sections"]))
         st.warning(
             f"⚠️ **Completeness check failed — treat this answer as PARTIAL.** "
             f"The policy defines *{cats}* in {secs}. " + "; ".join(parts) + "."

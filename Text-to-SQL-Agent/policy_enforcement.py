@@ -44,12 +44,19 @@ POLICY_CATEGORIES = [
     ("Substandard",               r"substandard",                                         "substandard"),
 ]
 
-# Keyword → DB column, applied to the policy lines found for a category.
-# Used to decide which criteria the agent MUST check in SQL.
-COLUMN_HINTS = [
+# A policy line is a CLASSIFICATION CRITERION when it states a threshold on one of these attributes
+# (what makes a client belong to the category). Lines without any of them only set LIMITS / consequences
+# for clients already in the category (max loan amount, guarantors, collateral, committee review) and
+# are EXCLUDED from "how many clients are <category>" questions.
+CRITERION_RE = re.compile(
+    r"score|employment|income|\bage\b|\baged\b|years old|\bdti\b|missed payment|default|"
+    r"marital|married|divorced|widowed|single"
+)
+
+# Criterion keyword → DB column (loan_amount is deliberately absent: amounts are limits, not criteria)
+CRITERION_HINTS = [
     (r"score",                                      "credit_score"),
     (r"employment",                                 "employment_years"),
-    (r"loan amount|loan amounts|\bils\b",           "loan_amount"),
     (r"income",                                     "annual_income"),
     (r"\bage\b|years old|\baged\b",                 "age"),
     (r"marital|married|divorced|widowed|single",    "marital_status"),
@@ -109,28 +116,38 @@ def scan_policy(chunks, terms: str) -> list[dict]:
 
 def detect_policy_categories(question: str, chunks) -> list[dict]:
     """
-    Every policy-defined category mentioned in the question, each with ALL its
-    policy sections and the DB columns that can verify criteria from those sections.
+    Every policy-defined category mentioned in the question. For each one:
+      sections        — CRITERION sections (lines with a classification threshold) → must be covered
+      limit_sections  — sections that only set limits/consequences for members → must be EXCLUDED
+      columns         — DB columns that can verify the criteria
     """
     q = normalize_for_match(question)
     found = []
     for label, trigger, terms in POLICY_CATEGORIES:
         if not re.search(trigger, q):
             continue
-        sections = scan_policy(chunks, terms)
-        if not sections:
+        all_sections = scan_policy(chunks, terms)
+        if not all_sections:
             continue
-        columns = []
-        for sec in sections:
+        criteria, limits, columns = [], [], []
+        for sec in all_sections:
             text = normalize_for_match(" ".join(sec["matching_lines"]))
-            for pat, col in COLUMN_HINTS:
-                if re.search(pat, text) and col not in columns:
-                    columns.append(col)
+            if CRITERION_RE.search(text):
+                criteria.append(sec)
+                for pat, col in CRITERION_HINTS:
+                    if re.search(pat, text) and col not in columns:
+                        columns.append(col)
+            else:
+                limits.append(sec)
+        if not criteria:            # category defined only by limits → nothing to count; keep for context
+            criteria, limits = all_sections, []
         found.append({
             "label": label,
             "terms": terms,
-            "sections": sections,
-            "section_ids": [s["section"].split(" ")[0] for s in sections],
+            "sections": criteria,
+            "limit_sections": limits,
+            "section_ids": [s["section"].split(" ")[0] for s in criteria],
+            "limit_section_ids": [s["section"].split(" ")[0] for s in limits],
             "columns": columns,
         })
     return found
@@ -148,24 +165,29 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
             lines.append(f"  Section {s['section']}:")
             lines += [f"    - {ln}" for ln in s["matching_lines"]]
         cols = ", ".join(c["columns"]) or "none"
-        parts.append(
-            f"Category '{c['label']}' (exhaustive scan for: {c['terms']}) appears in "
-            f"{len(c['sections'])} policy sections — ALL of them must be covered:\n"
-            + "\n".join(lines)
-            + f"\n  DB columns that can verify criteria from these sections: {cols}."
+        block = (
+            f"Category '{c['label']}' (exhaustive scan for: {c['terms']}).\n"
+            f"CLASSIFICATION CRITERIA — {len(c['sections'])} section(s) that define WHO belongs to the category. "
+            f"ALL of them must be covered:\n" + "\n".join(lines)
+            + f"\n  DB columns that can verify these criteria: {cols}."
         )
+        if c["limit_sections"]:
+            lim = "; ".join(f"Section {s['section']}" for s in c["limit_sections"])
+            block += (
+                f"\nLIMITS ONLY — {lim}: these sections set restrictions for clients who are ALREADY in the "
+                "category (maximum loan amount, guarantors, Credit Committee...). They are NOT criteria. "
+                "Do NOT mention them in the answer, do NOT add rows for them, do NOT list them in policy_sources."
+            )
+        parts.append(block)
 
     if enforce_sql:
         data_req = (
-            "2. ONE condition per section listed above (the section's numeric threshold for the category), each "
-            "checked STANDALONE over the WHOLE portfolio — never combined with AND, never nested inside another "
-            "condition, no secondary thresholds from the same section. Run ONE SQL query with: one count per "
-            "condition; ONE combined count = clients meeting AT LEAST ONE of the conditions (OR over ALL of "
-            "them); and the total.\n"
+            "2. Run ONE SQL query over the WHOLE portfolio with: one count per criterion above (each checked "
+            "standalone); ONE combined count = clients meeting AT LEAST ONE criterion (OR over the criteria); "
+            "and the total. No limit-related columns, no AND-combinations.\n"
             "3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {\"מדד\": label, \"ערך\": n} "
-            "(English: Metric / Value), in THIS order: one row per condition in bullet order (e.g. "
-            "\"לקוחות עם ציון מתחת ל-550\", \"לקוחות עם 0–1 שנות תעסוקה\", "
-            "\"לקוחות שההלוואה שלהם מעל תקרת 50,000 ש\"ח\"), then EXACTLY "
+            "(English: Metric / Value), in THIS order: one row per criterion in bullet order (e.g. "
+            "\"לקוחות עם ציון מתחת ל-550\", \"לקוחות עם 0–1 שנות תעסוקה\"), then EXACTLY "
             "\"לקוחות שעומדים בלפחות קריטריון אחד\" / \"Clients meeting at least one criterion\", then "
             "\"סך כל הלקוחות\" / \"Total clients\". No other rows. "
             "Set output_format to \"table+text\" (+sql if the user asked for the query).\n"
@@ -180,18 +202,17 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
         + "\n\nREQUIREMENTS FOR YOUR ANSWER (MANDATORY WORKFLOW):\n"
         "1. \"answer\" = the policy definition ONLY: the header line (\"לפי המדיניות, לקוחות בקטגוריית <label> "
         "מוגדרים על פי:\" / \"According to the policy, <label> clients are defined by:\") followed by ONE bullet "
-        "PER SECTION listed above, in section order, each ending with its section number — written as the word, "
-        "NEVER the '§' sign: Hebrew '(סעיף 2.1)', English '(Section 2.1)'. Use ONLY the section numbers given here. "
-        "No numbers/counts/limitations inside \"answer\".\n"
+        "PER CRITERION SECTION listed above, in section order, each ending with its section number — written as "
+        "the word, NEVER the '§' sign: Hebrew '(סעיף 2.1)', English '(Section 2.1)'. Use ONLY the criterion "
+        "section numbers given here. No numbers/counts inside \"answer\".\n"
         + data_req +
-        "4. \"data_coverage.missing\" = every criterion that cannot be checked in the data and why (guarantors, "
-        "Credit Committee review, approval rates, collateral, DTI, missed payments... are NOT in the DB); "
-        "\"data_coverage.checked\" = what you verified, with sections. The UI shows them under the table.\n"
-        "5. \"policy_sources\" = ALL the sections above. EVERY section number must appear EXPLICITLY in the "
-        "\"answer\" text as its own bullet. If two sections state the same rule (e.g. 2.1 and 8.1 both give the "
-        "50,000 ILS limit for Tier 4), keep BOTH bullets — do not merge or drop a section because it looks redundant.\n"
-        "An answer that omits any of these sections, or that is based on a single threshold, is INCOMPLETE "
-        "and will be rejected."
+        "4. \"data_coverage.checked\" = the criteria you verified, with sections. \"data_coverage.missing\" = "
+        "ONLY criteria that cannot be checked in the data (e.g. DTI, missed payments) — leave it EMPTY when every "
+        "criterion was verified. Never list limits (guarantors, committee, amounts) there.\n"
+        "5. \"policy_sources\" = exactly the criterion sections above. EVERY one of them must appear EXPLICITLY "
+        "in the \"answer\" text as its own bullet, and NO limit-only section may appear anywhere.\n"
+        "An answer that omits a criterion section, includes a limit-only section, or is based on a single "
+        "threshold is INCOMPLETE and will be rejected."
     )
 
 
@@ -200,37 +221,37 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
 # ─────────────────────────────────────────────
 
 def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) -> dict:
-    """Which expected sections / SQL columns are missing from the agent's JSON answer."""
-    # (a) sections listed in policy_sources
+    """Which criterion sections / SQL columns are missing, and which limit-only sections were wrongly cited."""
     in_sources = set()
     for s in data.get("policy_sources", []) or []:
         m = re.match(r"\s*(?:§|section|סעיף)?\s*(\d+\.\d+)", str(s), flags=re.IGNORECASE)
         if m:
             in_sources.add(m.group(1))
-    # (b) sections cited IN THE ANSWER TEXT — this is what the user actually reads, so it is the real gate.
-    #     policy_sources alone is NOT enough (the model used to list a section there and omit it from the text).
     answer_text = str(data.get("answer", "") or "")
     in_answer = set(re.findall(r"(?:§|section|סעיף)\s*(\d+\.\d+)", answer_text, flags=re.IGNORECASE))
-    # plural lists: "סעיפים 2.1, 4.1 ו-8.1" / "Sections 2.1, 4.1 and 8.1" / "Sections 2.1/8.1"
     for lst in re.findall(r"(?:sections|סעיפים)\s*((?:\d+\.\d+[\s,/]*(?:and|ו-|ו)?\s*)+)", answer_text, flags=re.IGNORECASE):
         in_answer.update(re.findall(r"\d+\.\d+", lst))
 
     sql = (data.get("sql_query") or "").lower()
-    expected_sections, expected_columns = [], []
+    expected_sections, expected_columns, excluded_sections = [], [], []
     for c in categories:
         expected_sections += [s for s in c["section_ids"] if s not in expected_sections]
         expected_columns += [col for col in c["columns"] if col not in expected_columns]
+        excluded_sections += [s for s in c.get("limit_section_ids", []) if s not in excluded_sections]
 
     missing_sections = [s for s in expected_sections if s not in in_answer]
     missing_in_sources = [s for s in expected_sections if s not in in_sources]
+    unexpected_sections = [s for s in excluded_sections if s in in_answer or s in in_sources]
     missing_columns = [c for c in expected_columns if c not in sql] if (enforce_sql or sql) else []
     return {
         "expected_sections": expected_sections,
+        "excluded_sections": excluded_sections,
         "expected_columns": expected_columns,
-        "missing_sections": missing_sections,          # not mentioned in the answer text
-        "missing_in_sources": missing_in_sources,      # not listed in policy_sources
+        "missing_sections": missing_sections,          # criterion sections not mentioned in the answer text
+        "missing_in_sources": missing_in_sources,      # criterion sections not listed in policy_sources
+        "unexpected_sections": unexpected_sections,    # limit-only sections that were wrongly included
         "missing_columns": missing_columns,
-        "ok": not missing_sections and not missing_in_sources and not missing_columns,
+        "ok": not missing_sections and not missing_in_sources and not unexpected_sections and not missing_columns,
     }
 
 
@@ -243,6 +264,10 @@ def build_correction(report: dict) -> str:
                   "even if it repeats a rule already stated in another section.\n")
     if report.get("missing_in_sources"):
         msg += "- Sections missing from policy_sources: " + ", ".join(report["missing_in_sources"]) + "\n"
+    if report.get("unexpected_sections"):
+        msg += ("- Sections you included that are NOT criteria (they only set limits for clients already in the "
+                "category) and must be REMOVED from the answer, the table and policy_sources: "
+                + ", ".join("Section " + s for s in report["unexpected_sections"]) + "\n")
     if report["missing_columns"]:
         msg += "- DB columns your SQL did not check: " + ", ".join(report["missing_columns"]) + "\n"
     msg += (
@@ -264,4 +289,4 @@ if __name__ == "__main__":
               "מה אחוז ה-Default בתיק?"]:
         cats = detect_policy_categories(q, chunks)
         print(f"\nQ: {q}\n   data intent: {wants_data(q)} | categories: "
-              + (", ".join(f"{c['label']} → Sections {'/'.join(c['section_ids'])} | cols={c['columns']}" for c in cats) or "none"))
+              + (", ".join(f"{c['label']} → criteria {'/'.join(c['section_ids'])} | excluded limits {'/'.join(c['limit_section_ids']) or '-'} | cols={c['columns']}" for c in cats) or "none"))
