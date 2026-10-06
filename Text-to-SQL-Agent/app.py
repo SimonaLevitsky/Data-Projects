@@ -371,6 +371,9 @@ STEP 3 — ONE CONDITION PER CRITERION SECTION, EACH COUNTED OVER THE WHOLE PORT
    FROM loans l JOIN demographics d ON l.client_id = d.client_id;
    This rule is GENERAL: whenever a question involves several criteria, report each criterion separately,
    then "at least one criterion", then the total. Never add AND-combinations or limit columns.
+   SINGLE criterion (e.g. "clients below the minimum income"): the query has just the criterion count and
+   the total; the table has just those two rows — NO "at least one criterion" row.
+   NEVER add columns or rows the user did not ask for (no percentages / shares / ratios unless asked).
 
 STEP 4 — ANSWER STRUCTURE (STRICT — the UI renders these fields in a fixed layout):
 
@@ -791,7 +794,7 @@ def run_agent(query: str, status=None) -> dict:
         return apply_format_requests(query, data)
 
     retries = 0
-    report = check_completeness(data, categories, enforce_sql)
+    report = check_completeness(data, categories, enforce_sql, query)
     while not report["ok"] and retries < MAX_COMPLETENESS_RETRIES:
         retries += 1
         say(f"בדיקת שלמות נכשלה (חסר: {report['missing_sections'] + report['missing_columns']}) — סבב תיקון {retries}...")
@@ -799,13 +802,13 @@ def run_agent(query: str, status=None) -> dict:
         result = _invoke_agent(result["messages"] + [("human", build_correction(report))])
         timings[f"correction {retries}"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
         data = parse_agent_output(result)
-        report = check_completeness(data, categories, enforce_sql)
+        report = check_completeness(data, categories, enforce_sql, query)
 
     # Deterministic clean-up of whatever the model still got wrong, then re-check the cleaned answer
-    cleaned = sanitize_policy_answer(data, categories, report)
+    cleaned = sanitize_policy_answer(data, categories, report, query)
     if cleaned:
         say("ניקוי אוטומטי: " + "; ".join(cleaned))
-        report = check_completeness(data, categories, enforce_sql)
+        report = check_completeness(data, categories, enforce_sql, query)
     data["confidence_score"] = final_confidence(data, report)
 
     say("בדיקת שלמות עברה ✅" if report["ok"] else "בדיקת שלמות עדיין נכשלת — מציג תשובה חלקית ⚠️")

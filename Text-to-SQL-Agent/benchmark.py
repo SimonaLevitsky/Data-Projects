@@ -163,7 +163,10 @@ def _conf(data) -> int:
 
 
 def _norm_label(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s)).strip()
+    """Whitespace-collapsed label; dashes unified (0-1 == 0–1) and trailing punctuation ignored."""
+    t = str(s).replace("–", "-").replace("—", "-").replace("־", "-")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.rstrip(":.").strip()
 
 
 def score_question(q: dict, data: dict, counts_before: dict, counts_after: dict, latency: float) -> dict:

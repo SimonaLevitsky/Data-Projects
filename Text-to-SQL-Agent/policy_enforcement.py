@@ -84,6 +84,48 @@ def normalize_for_match(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+# Columns/rows the user did not ask for: percentages, shares, ratios.
+RATIO_Q_RE      = re.compile(r"אחוז|שיעור|percent|share|ratio|\brate\b", re.IGNORECASE)
+RATIO_EXPR_RE   = re.compile(r"/|\*\s*100|\b(percent|percentage|share|ratio|rate|pct)\b", re.IGNORECASE)
+COMBINED_LABEL_RE = re.compile(r"לפחות קריטריון|at least one", re.IGNORECASE)
+
+def asks_ratio(question: str) -> bool:
+    return bool(RATIO_Q_RE.search(question or ""))
+
+def _split_top_level(s: str, sep: str = ",") -> list[str]:
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append("".join(cur)); cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+def ratio_columns(sql: str) -> list[str]:
+    """SELECT-list expressions that compute a percentage / share / ratio."""
+    m = re.match(r"(?is)^\s*select\s+(.*?)\s+from\s+", (sql or "").strip())
+    if not m:
+        return []
+    return [e.strip() for e in _split_top_level(m.group(1)) if RATIO_EXPR_RE.search(e)]
+
+def strip_ratio_columns(sql: str) -> tuple[str, int]:
+    """Remove ratio expressions from the SELECT list. Returns (new_sql, removed_count)."""
+    m = re.match(r"(?is)^\s*select\s+(.*?)\s+from\s+(.*)$", (sql or "").strip().rstrip(";"))
+    if not m:
+        return sql, 0
+    exprs = _split_top_level(m.group(1))
+    keep = [e.strip() for e in exprs if not RATIO_EXPR_RE.search(e)]
+    removed = len(exprs) - len(keep)
+    if removed == 0 or not keep:
+        return sql, 0
+    return "SELECT " + ", ".join(keep) + " FROM " + m.group(2).strip() + ";", removed
+
+
 def wants_data(question: str) -> bool:
     return bool(DATA_INTENT_RE.search(normalize_for_match(question)))
 
@@ -250,16 +292,28 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
             )
         parts.append(block)
 
-    if enforce_sql:
+    n_criteria = sum(len(c["sections"]) for c in categories)
+    if enforce_sql and n_criteria == 1:
+        data_req = (
+            "2. There is exactly ONE criterion. Run ONE SQL query over the WHOLE portfolio with: the count of "
+            "clients meeting it, and the total — nothing else. No percentage/share/ratio column unless the user "
+            "asked for one, no limit-related columns.\n"
+            "3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {\"מדד\": label, \"ערך\": n} "
+            "(English: Metric / Value), in THIS order: the criterion row, then \"סך כל הלקוחות\" / \"Total clients\". "
+            "Do NOT add a \"לקוחות שעומדים בלפחות קריטריון אחד\" row — it is meaningless with a single criterion. "
+            "No other rows. Set output_format to \"table+text\" (+sql if the user asked for the query).\n"
+        )
+    elif enforce_sql:
         data_req = (
             "2. Run ONE SQL query over the WHOLE portfolio with: one count per criterion above (each checked "
             "standalone); ONE combined count = clients meeting AT LEAST ONE criterion (OR over the criteria); "
-            "and the total. No limit-related columns, no AND-combinations.\n"
+            "and the total. No limit-related columns, no AND-combinations, no percentage/share/ratio columns "
+            "unless the user asked for them.\n"
             "3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {\"מדד\": label, \"ערך\": n} "
             "(English: Metric / Value), in THIS order: one row per criterion in bullet order (e.g. "
             "\"לקוחות עם ציון מתחת ל-550\", \"לקוחות עם 0–1 שנות תעסוקה\"), then EXACTLY "
             "\"לקוחות שעומדים בלפחות קריטריון אחד\" / \"Clients meeting at least one criterion\", then "
-            "\"סך כל הלקוחות\" / \"Total clients\". No other rows. "
+            "\"סך כל הלקוחות\" / \"Total clients\". No other rows, no percentage/share/ratio rows. "
             "Set output_format to \"table+text\" (+sql if the user asked for the query).\n"
         )
     else:
@@ -290,7 +344,7 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
 # 3. Validation
 # ─────────────────────────────────────────────
 
-def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) -> dict:
+def check_completeness(data: dict, categories: list[dict], enforce_sql: bool, question: str = "") -> dict:
     """Which criterion sections / SQL columns are missing, and which limit-only sections were wrongly cited."""
     in_sources = set()
     for s in data.get("policy_sources", []) or []:
@@ -331,8 +385,19 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
     forbidden = [c for c in CHECKABLE_COLUMNS if c not in expected_columns]
     forbidden_columns_used = [c for c in forbidden if re.search(r"\b" + c + r"\b", sql)] if sql else []
     has_unverifiable = any(c.get("unverifiable_sections") for c in categories)
+    # nothing the user did not ask for
+    unrequested_ratio = ratio_columns(sql) if (sql and not asks_ratio(question)) else []
+    single = len(expected_sections) == 1
+    rows = [r for r in (data.get("table_data") or []) if isinstance(r, dict) and r]
+    labels = [str(next(iter(r.values()), "")) for r in rows]
+    redundant_combined_row = single and any(COMBINED_LABEL_RE.search(l) for l in labels)
+    unrequested_ratio_row = (not asks_ratio(question)) and any(RATIO_Q_RE.search(l) for l in labels)
     return {
         "mode": "membership",
+        "single_criterion": single,
+        "unrequested_ratio": unrequested_ratio,
+        "redundant_combined_row": redundant_combined_row,
+        "unrequested_ratio_row": unrequested_ratio_row,
         "expected_sections": expected_sections,
         "excluded_sections": excluded_sections,
         "expected_columns": expected_columns,
@@ -345,11 +410,12 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
         "multi_statement": multi_statement,            # more than one SQL statement
         "forbidden_columns_used": forbidden_columns_used,  # limit columns (e.g. loan_amount) in the SQL
         "ok": not (missing_sections or missing_in_sources or unexpected_sections or missing_columns
-                   or multi_statement or forbidden_columns_used),
+                   or multi_statement or forbidden_columns_used or unrequested_ratio
+                   or redundant_combined_row or unrequested_ratio_row),
     }
 
 
-def sanitize_policy_answer(data: dict, categories: list[dict], report: dict) -> list[str]:
+def sanitize_policy_answer(data: dict, categories: list[dict], report: dict, question: str = "") -> list[str]:
     """
     Deterministic clean-up applied AFTER the retry round, so what the user sees is right even if the
     model ignored a correction. Returns a list of human-readable notes describing what was changed.
@@ -377,6 +443,24 @@ def sanitize_policy_answer(data: dict, categories: list[dict], report: dict) -> 
     if len(statements) > 1:
         data["sql_query"] = statements[0] + ";"
         notes.append(f"dropped {len(statements) - 1} extra SQL statement(s)")
+
+    # 1b. columns / rows the user did not ask for (percentages, shares) and a meaningless combined row
+    if not asks_ratio(question):
+        new_sql, n = strip_ratio_columns(data.get("sql_query") or "")
+        if n:
+            data["sql_query"] = new_sql
+            notes.append(f"removed {n} unrequested ratio column(s) from the SQL")
+    rows = [r for r in (data.get("table_data") or []) if isinstance(r, dict) and r]
+    kept = []
+    for r in rows:
+        label = str(next(iter(r.values()), ""))
+        if not asks_ratio(question) and RATIO_Q_RE.search(label):
+            notes.append("removed an unrequested ratio row from the table"); continue
+        if report.get("single_criterion") and COMBINED_LABEL_RE.search(label):
+            notes.append("removed the 'at least one criterion' row (single criterion)"); continue
+        kept.append(r)
+    if len(kept) != len(rows):
+        data["table_data"] = kept
 
     # 2. answer text: remove bullet lines that cite an excluded (limit-only) section
     if excluded:
@@ -450,6 +534,13 @@ def build_correction(report: dict) -> str:
                 "policy sections with their exact figures.\n")
     if report.get("multi_statement"):
         msg += "- Your sql_query contains more than one statement. Return EXACTLY ONE SELECT statement.\n"
+    if report.get("unrequested_ratio"):
+        msg += ("- Your SQL computes a percentage/share the user did not ask for — remove: "
+                + "; ".join(report["unrequested_ratio"]) + "\n")
+    if report.get("unrequested_ratio_row"):
+        msg += "- Remove the percentage/share row from table_data — the user did not ask for it.\n"
+    if report.get("redundant_combined_row"):
+        msg += "- There is only ONE criterion: remove the 'לקוחות שעומדים בלפחות קריטריון אחד' row.\n"
     if report.get("forbidden_columns_used"):
         msg += ("- Your SQL uses columns that belong to LIMITS, not criteria, and must be removed: "
                 + ", ".join(report["forbidden_columns_used"]) + "\n")
