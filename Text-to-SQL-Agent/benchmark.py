@@ -181,7 +181,13 @@ def score_question(q: dict, data: dict, counts_before: dict, counts_after: dict,
         ok, msg = execution_match(sql, q)
         checks["execution_accuracy"] = ok
         details.append(msg)
-        gold_nums = [c for row in q["expected_result"]["rows"] for c in row if isinstance(c, (int, float))]
+        # Measure values that should appear in the prose: a single-row result → every numeric cell;
+        # a multi-row result → the last column only (earlier columns are keys/categories such as 0/1 flags).
+        rows_g = q["expected_result"]["rows"]
+        if len(rows_g) == 1:
+            gold_nums = [c for c in rows_g[0] if isinstance(c, (int, float))]
+        else:
+            gold_nums = [r[-1] for r in rows_g if r and isinstance(r[-1], (int, float))]
         checks["answer_has_gold_values"] = all(number_present(float(v), numbers_in(answer)) for v in gold_nums) if gold_nums else True
 
     if t == "calculator":

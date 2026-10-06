@@ -411,7 +411,7 @@ Always return a valid JSON object with exactly these fields:
 
 {
   "answer": "Natural language finding in the user's language.",
-  "sql_query": "SQL executed, or empty string if no database query was run.",
+  "sql_query": "ALWAYS the exact final SQL you executed with sql_db_query — even when the user did NOT ask to see the query (the UI decides whether to display it). Empty string ONLY if no database query was run.",
   "tool_used": "<one of: database | calculator | policy | hybrid | none>",
   "confidence_score": <integer 0-100>,
   "output_format": "<one of: text | table | sql | text+sql | table+sql | table+text+sql>",
@@ -544,6 +544,32 @@ def confidence_badge(score: int) -> str:
         f'{label} confidence ({score}%)</span>'
     )
 
+SQL_EXEC_TOOLS = {"sql_db_query"}   # the toolkit tool that actually runs SQL (not list_tables / schema / checker)
+
+def extract_executed_sql(messages: list) -> str:
+    """
+    Ground truth from the agent trace: the LAST sql_db_query call whose tool result was not an error.
+    The model's self-reported "sql_query" field is unreliable (it is often left empty when the user did
+    not ask to see the query), but the tool calls in the message history are what really ran.
+    """
+    calls, order = {}, []
+    for m in messages:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            if tc.get("name") in SQL_EXEC_TOOLS:
+                q = str((tc.get("args") or {}).get("query") or "").strip()
+                if q:
+                    calls[tc.get("id")] = {"query": q, "ok": True}
+                    order.append(tc.get("id"))
+        if getattr(m, "type", "") == "tool" and getattr(m, "tool_call_id", None) in calls:
+            content = str(getattr(m, "content", "")).strip()
+            if content.lower().startswith("error") or "operationalerror" in content.lower():
+                calls[m.tool_call_id]["ok"] = False
+    for cid in reversed(order):
+        if calls[cid]["ok"]:
+            return calls[cid]["query"]
+    return ""
+
+
 def parse_agent_output(result: dict) -> dict:
     messages = result.get("messages", [])
     raw = messages[-1].content if messages else ""
@@ -558,14 +584,25 @@ def parse_agent_output(result: dict) -> dict:
         data.setdefault("table_data", [])
         data.setdefault("policy_sources", [])
         data.setdefault("data_coverage", {"checked": [], "missing": []})
-        return strip_section_sign(data)
+        data = strip_section_sign(data)
     except (json.JSONDecodeError, AttributeError):
-        return {
+        data = {
             "answer": raw or "לא התקבלה תשובה מהסוכן.",
             "sql_query": "", "tool_used": "database",
             "confidence_score": 50, "output_format": "text", "table_data": [],
             "policy_sources": [], "data_coverage": {"checked": [], "missing": []}
         }
+
+    # Prefer the SQL that was actually executed over the model's self-report
+    executed = extract_executed_sql(messages)
+    reported = (data.get("sql_query") or "").strip()
+    if executed:
+        if reported and reported.rstrip(";") != executed.rstrip(";"):
+            data["sql_reported_by_model"] = reported
+        data["sql_query"] = executed
+        if not reported:
+            data["sql_recovered_from_trace"] = True
+    return data
 
 MAX_COMPLETENESS_RETRIES = 1  # one automatic correction round if the answer is incomplete
 
@@ -796,6 +833,8 @@ def render_response(data: dict):
     if "sql" in fmt and sql_query:
         with st.expander("🔍 SQL Query"):
             st.code(sql_query, language="sql")
+            if data.get("sql_recovered_from_trace"):
+                st.caption("Recovered from the agent's tool calls (the model left sql_query empty).")
 
     # Policy sources expander (RAG transparency)
     if sources:
