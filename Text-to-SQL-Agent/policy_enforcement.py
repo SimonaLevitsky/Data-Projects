@@ -535,6 +535,11 @@ def sanitize_policy_answer(data: dict, categories: list[dict], report: dict, que
         cov["missing"] = []
         notes.append("cleared the 'cannot be verified' list (all criteria are verifiable in the DB)")
 
+    # 6. routing label is a fact, not a self-report: policy context was injected AND SQL ran → hybrid
+    if (data.get("sql_query") or "").strip() and data.get("tool_used") != "hybrid":
+        data["tool_used"] = "hybrid"
+        notes.append("routing label set to 'hybrid' (policy definition + database query)")
+
     return notes
 
 
