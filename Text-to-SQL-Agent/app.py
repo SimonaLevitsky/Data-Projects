@@ -59,6 +59,23 @@ db = SQLDatabase.from_uri(
     include_tables=["loans", "demographics"],
     sample_rows_in_table_info=2
 )
+MAX_TABLE_ROWS = 200
+
+def run_sql_readonly(sql: str) -> list[dict]:
+    """Execute ONE SELECT on a READ-ONLY connection and return rows as dicts. Non-SELECT → ValueError."""
+    stmt = next((p.strip() for p in (sql or "").split(";") if p.strip()), "")
+    if not stmt:
+        return []
+    if not stmt.lower().startswith(("select", "with")):
+        raise ValueError("only SELECT queries are allowed (the database is read-only)")
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cur = con.execute(stmt)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchmany(MAX_TABLE_ROWS)]
+    finally:
+        con.close()
+
 startup_log("DB ready; parsing policy document (local, no network)")
 
 # --- Policy Vector Store (RAG) ---
@@ -477,8 +494,32 @@ llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=openai_api_key, timeou
 st.session_state.setdefault("model_name", MODEL_NAME)
 AGENT_RECURSION_LIMIT = 30  # max agent steps (model calls + tool calls) per attempt — prevents endless tool loops
 
+RAW_ROWS_WARN = 10   # above this, a non-aggregated result gets an explicit "aggregate in SQL" reminder
+
+@tool("sql_db_query")
+def sql_db_query(query: str) -> str:
+    """
+    Execute a SELECT query against the SQLite database and return the rows.
+    If an error is returned, rewrite the query and try again.
+    RULES: the database is READ-ONLY (SELECT only). For ANY statistic — average, count, percentage,
+    rate, sum, min/max — compute it IN SQL (AVG/COUNT/SUM/MIN/MAX, GROUP BY). NEVER fetch raw rows
+    and compute the statistic yourself: your arithmetic over many rows is unreliable.
+    """
+    try:
+        rows = run_sql_readonly(query)
+    except Exception as e:
+        return f"Error: {e}"
+    out = str([tuple(r.values()) for r in rows])
+    if len(rows) >= MAX_TABLE_ROWS:
+        out += f"\n(NOTE: output truncated to the first {MAX_TABLE_ROWS} rows.)"
+    if len(rows) > RAW_ROWS_WARN and not re.search(r"\b(avg|sum|count|min|max|group\s+by)\b", query, re.IGNORECASE):
+        out += (f"\n(NOTE: {len(rows)} raw rows returned. If the user asked for a statistic such as an average, "
+                "count, rate or percentage, do NOT compute it from these rows — run an aggregate query "
+                "(AVG/COUNT/SUM with GROUP BY) and report its exact result.)")
+    return out
+
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-sql_tools = toolkit.get_tools()
+sql_tools = [t for t in toolkit.get_tools() if t.name != "sql_db_query"] + [sql_db_query]
 calculator_tools = [calculate_monthly_payment, calculate_compound_interest, calculate_debt_to_income]
 policy_tools = [search_credit_policy, find_all_policy_mentions]
 
@@ -546,12 +587,18 @@ def confidence_badge(score: int) -> str:
     )
 
 SQL_EXEC_TOOLS = {"sql_db_query"}   # the toolkit tool that actually runs SQL (not list_tables / schema / checker)
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
-def extract_executed_sql(messages: list) -> str:
+def _norm_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", (sql or "").strip().rstrip(";")).strip().lower()
+
+def _nums(text: str) -> list[float]:
+    return [float(x) for x in _NUM_RE.findall(str(text).replace(",", ""))]
+
+def executed_sql_calls(messages: list) -> list[dict]:
     """
-    Ground truth from the agent trace: the LAST sql_db_query call whose tool result was not an error.
-    The model's self-reported "sql_query" field is unreliable (it is often left empty when the user did
-    not ask to see the query), but the tool calls in the message history are what really ran.
+    Every sql_db_query call in the agent trace, in order: {"query", "ok", "result"}.
+    `ok` is False when the tool returned an error. This is the ground truth of what really ran.
     """
     calls, order = {}, []
     for m in messages:
@@ -559,16 +606,40 @@ def extract_executed_sql(messages: list) -> str:
             if tc.get("name") in SQL_EXEC_TOOLS:
                 q = str((tc.get("args") or {}).get("query") or "").strip()
                 if q:
-                    calls[tc.get("id")] = {"query": q, "ok": True}
+                    calls[tc.get("id")] = {"query": q, "ok": True, "result": ""}
                     order.append(tc.get("id"))
         if getattr(m, "type", "") == "tool" and getattr(m, "tool_call_id", None) in calls:
             content = str(getattr(m, "content", "")).strip()
+            calls[m.tool_call_id]["result"] = content
             if content.lower().startswith("error") or "operationalerror" in content.lower():
                 calls[m.tool_call_id]["ok"] = False
-    for cid in reversed(order):
-        if calls[cid]["ok"]:
-            return calls[cid]["query"]
-    return ""
+    return [calls[c] for c in order]
+
+
+def select_final_sql(messages: list, reported: str, answer: str) -> tuple[str, str]:
+    """
+    Decide which SQL is "the" query behind the answer. Returns (sql, how).
+      1. The model reported a query and it is one of the executed queries → the report (canonical form).
+      2. The model reported a query that is not in the trace (cleaned/paraphrased) → keep the report.
+      3. No report → among the successful executed queries, the one whose RESULT shares the most
+         numbers with the answer text (the agent often runs extra exploratory queries, e.g. a COUNT,
+         after the real one, so "the last query" is not a safe choice). Ties → the later query.
+    """
+    calls = [c for c in executed_sql_calls(messages) if c["ok"]]
+    rep = (reported or "").strip()
+    if rep:
+        for c in calls:
+            if _norm_sql(c["query"]) == _norm_sql(rep):
+                return rep, "reported (verified in trace)"
+        return rep, "reported"
+    if not calls:
+        return "", "none"
+    ans_nums = _nums(answer)
+    def overlap(c):
+        res_nums = _nums(c["result"])
+        return sum(1 for a in ans_nums if any(abs(a - r) <= max(abs(a) * 0.005, 0.01) for r in res_nums))
+    best = max(range(len(calls)), key=lambda i: (overlap(calls[i]), i))
+    return calls[best]["query"], ("trace (result matches answer)" if overlap(calls[best]) > 0 else "trace (last query)")
 
 
 def parse_agent_output(result: dict) -> dict:
@@ -594,37 +665,52 @@ def parse_agent_output(result: dict) -> dict:
             "policy_sources": [], "data_coverage": {"checked": [], "missing": []}
         }
 
-    # Prefer the SQL that was actually executed over the model's self-report
-    executed = extract_executed_sql(messages)
     reported = (data.get("sql_query") or "").strip()
-    if executed:
-        if reported and reported.rstrip(";") != executed.rstrip(";"):
-            data["sql_reported_by_model"] = reported
-        data["sql_query"] = executed
+    sql, how = select_final_sql(messages, reported, data.get("answer", ""))
+    if sql:
+        data["sql_query"] = sql
+        data["sql_source"] = how
         if not reported:
             data["sql_recovered_from_trace"] = True
     return data
+
+# ── SQL sanity: a statistic must be computed in SQL, not by the model over raw rows ─────────────
+AGG_QUESTION_RE = re.compile(
+    r"ממוצע|סכום|סה\"כ|כמה|אחוז|שיעור|מקסימ|מינימ|הגבוה ביותר|הנמוך ביותר|"
+    r"\b(average|avg|mean|sum|total|count|how many|percent|percentage|rate|max|min|highest|lowest)\b",
+    re.IGNORECASE)
+AGG_SQL_RE   = re.compile(r"\b(avg|sum|count|min|max|group\s+by)\b", re.IGNORECASE)
+TOPN_SQL_RE  = re.compile(r"order\s+by[\s\S]*\blimit\b", re.IGNORECASE)
+
+def sql_sanity_issue(query: str, data: dict) -> str | None:
+    """Return a reason string when the SQL cannot support the statistic the user asked for."""
+    tool = data.get("tool_used")
+    sql = (data.get("sql_query") or "").strip()
+    if tool not in ("database", "hybrid"):
+        return None
+    if not AGG_QUESTION_RE.search(query):
+        return None
+    if not sql:
+        return "a data question was answered without any SQL"
+    if not AGG_SQL_RE.search(sql) and not TOPN_SQL_RE.search(sql):
+        return "the SQL selects raw rows (no AVG/COUNT/SUM/MIN/MAX/GROUP BY) — the statistic was computed by the model, not by the database"
+    return None
+
+def sql_sanity_correction(reason: str, data: dict) -> str:
+    return (
+        f"Your previous answer was REJECTED by an automatic SQL check: {reason}.\n"
+        f"SQL you used: {data.get('sql_query') or '(none)'}\n"
+        "Write ONE aggregate SQL query that computes the requested statistic in the database "
+        "(AVG / COUNT / SUM / MIN / MAX, with GROUP BY when comparing groups), run it with sql_db_query, "
+        "and report ITS exact result — do not compute anything yourself. Put that query in sql_query. "
+        "Return ONLY the JSON object."
+    )
 
 # ── Deterministic output-format requests ───────────────────────────────────────────────
 # The model often sets output_format = "text" even when the user wrote "תציג שאילתה" / "הצג טבלה".
 # The display decision is taken from the user's words, not from the model's self-report.
 WANTS_SQL_RE   = re.compile(r"שאילת|\bsql\b|\bquery\b|קוד", re.IGNORECASE)
 WANTS_TABLE_RE = re.compile(r"טבל|\btable\b", re.IGNORECASE)
-MAX_TABLE_ROWS = 200
-
-def run_sql_readonly(sql: str) -> list[dict]:
-    """Execute ONE SELECT on a read-only connection and return rows as dicts (for building a table)."""
-    stmt = next((p.strip() for p in (sql or "").split(";") if p.strip()), "")
-    if not stmt or not stmt.lower().startswith(("select", "with")):
-        return []
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        cur = con.execute(stmt)
-        cols = [c[0] for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchmany(MAX_TABLE_ROWS)]
-    finally:
-        con.close()
-
 def apply_format_requests(query: str, data: dict) -> dict:
     """Force the SQL expander / table on when the question asked for them, whatever the model chose."""
     parts = [p for p in str(data.get("output_format", "text")).split("+") if p]
@@ -684,6 +770,20 @@ def run_agent(query: str, status=None) -> dict:
     result = _invoke_agent([("human", agent_input)])
     timings["attempt 1"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
     data = parse_agent_output(result)
+
+    # SQL sanity (all data questions): statistic computed in SQL? one correction round if not
+    issue = sql_sanity_issue(query, data)
+    sql_retried = False
+    if issue:
+        say(f"בדיקת SQL נכשלה ({issue}) — סבב תיקון...")
+        t1 = time.time()
+        result = _invoke_agent(result["messages"] + [("human", sql_sanity_correction(issue, data))])
+        timings["sql correction"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
+        data = parse_agent_output(result)
+        issue = sql_sanity_issue(query, data)
+        sql_retried = True
+    if sql_retried or issue:
+        data["_sql_sanity"] = {"ok": issue is None, "reason": issue, "retried": sql_retried}
 
     if not categories:
         timings["total"] = f"{time.time() - t0:.1f}s"
@@ -779,6 +879,15 @@ def render_policy_answer(answer: str, table_data: list, missing: list):
         title = "**⚠️ קריטריונים שלא ניתן לבדוק בנתונים:**" if hebrew else "**⚠️ Criteria that cannot be verified in the data:**"
         rtl_markdown(title + "\n\n" + "\n".join(f"- {m}" for m in missing))
 
+def render_sql_sanity(data: dict):
+    ss = data.get("_sql_sanity")
+    if not ss:
+        return
+    if ss.get("ok"):
+        st.caption("🔁 SQL regenerated after an automatic check (the first query did not compute the statistic in SQL).")
+    else:
+        st.warning(f"⚠️ **SQL check failed — treat the values as unverified.** {ss.get('reason')}.")
+
 def render_completeness(comp):
     """Show the verdict of the Python-level policy completeness check (if the question triggered it)."""
     if not comp:
@@ -870,6 +979,7 @@ def render_response(data: dict):
             elif answer:
                 rtl_markdown(answer)
 
+    render_sql_sanity(data)
     render_completeness(comp)
 
     # Badges row
