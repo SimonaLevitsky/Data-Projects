@@ -88,6 +88,18 @@ def wants_data(question: str) -> bool:
     return bool(DATA_INTENT_RE.search(normalize_for_match(question)))
 
 
+# MEMBERSHIP question = count/list clients of a category ("כמה לקוחות הם High Risk", "which clients are Prime").
+# Anything else that mentions a category is a RULE question ("מהי תקרת ההלוואה ל-Tier 2", "what does the policy
+# say about guarantors") — there the LIMIT sections are exactly what is asked, and no SQL must run.
+MEMBERSHIP_RE = re.compile(
+    r"כמה|how many|\bcount\b|מספר ה|אחוז|שיעור|percent|share|"
+    r"(?:אילו|איזה|which|list|רשימת|הצג)\W+(?:\w+\W+){0,1}?(?:לקוח|הלווא|client|loan|borrower)",
+    re.IGNORECASE)
+
+def question_mode(question: str) -> str:
+    return "membership" if MEMBERSHIP_RE.search(normalize_for_match(question)) else "rule"
+
+
 def scan_policy(chunks, terms: str) -> list[dict]:
     """
     EXHAUSTIVE scan: every policy sub-section whose text mentions any of the terms
@@ -126,12 +138,29 @@ def detect_policy_categories(question: str, chunks) -> list[dict]:
       columns         — DB columns that can verify the criteria
     """
     q = normalize_for_match(question)
+    mode = question_mode(question)
     found = []
     for label, trigger, terms in POLICY_CATEGORIES:
         if not re.search(trigger, q):
             continue
         all_sections = scan_policy(chunks, terms)
         if not all_sections:
+            continue
+        if mode == "rule":
+            # A section is REQUIRED when the category is the subject of one of its lines
+            # ("Tier 2 (Near-Prime): Up to 200,000 ILS..."), OPTIONAL when it is only mentioned in passing
+            # ("...approved automatically if credit score is Tier 1 or Tier 2"). No subject lines → all required.
+            norm_terms = [normalize_for_match(t) for t in re.split(r"[|,]", terms) if t.strip()]
+            subject = [s for s in all_sections
+                       if any(normalize_for_match(ln).startswith(t) for ln in s["matching_lines"] for t in norm_terms)]
+            required = subject or all_sections
+            optional = [s for s in all_sections if s not in required]
+            found.append({
+                "label": label, "terms": terms, "mode": "rule",
+                "sections": required, "optional_sections": optional, "limit_sections": [],
+                "section_ids": [s["section"].split(" ")[0] for s in required],
+                "limit_section_ids": [], "columns": [], "unverifiable_sections": [],
+            })
             continue
         criteria, limits, columns = [], [], []
         for sec in all_sections:
@@ -150,6 +179,7 @@ def detect_policy_categories(question: str, chunks) -> list[dict]:
         found.append({
             "label": label,
             "terms": terms,
+            "mode": "membership",
             "sections": criteria,
             "limit_sections": limits,
             "section_ids": [s["section"].split(" ")[0] for s in criteria],
@@ -164,7 +194,40 @@ def detect_policy_categories(question: str, chunks) -> list[dict]:
 # 2. Context injection
 # ─────────────────────────────────────────────
 
+def build_rule_context(categories: list[dict]) -> str:
+    parts = []
+    for c in categories:
+        lines = []
+        for s in c["sections"]:
+            lines.append(f"  Section {s['section']}:")
+            lines += [f"    - {ln}" for ln in s["matching_lines"]]
+        block = f"Category '{c['label']}' — policy sections about it (MUST all be cited):\n" + "\n".join(lines)
+        if c.get("optional_sections"):
+            opt = []
+            for s in c["optional_sections"]:
+                opt.append(f"  Section {s['section']}:")
+                opt += [f"    - {ln}" for ln in s["matching_lines"]]
+            block += "\nSections that only mention it in passing (cite if relevant to the question):\n" + "\n".join(opt)
+        parts.append(block)
+    return (
+        "\n\n[POLICY CONTEXT — injected automatically by the system. This question asks what the POLICY SAYS about "
+        "the category (a rule, a limit, a requirement), NOT about the portfolio data.]\n"
+        + "\n\n".join(parts)
+        + "\n\nREQUIREMENTS FOR YOUR ANSWER:\n"
+        "1. Answer ONLY from the sections above. Do NOT query the database — no sql_db_query call; "
+        "sql_query = \"\", table_data = [], tool_used = \"policy\", output_format = \"text\".\n"
+        "2. State the specific figures the question asks for EXACTLY as written in the policy "
+        "(amounts such as \"200,000 ILS\", score ranges, percentages, durations).\n"
+        "3. Cite EVERY section listed above in the answer text, written as the word — Hebrew \"סעיף 8.1\", "
+        "English \"Section 8.1\" — never the '§' sign. policy_sources = all of these sections.\n"
+        "4. confidence_score 90-100: the answer is grounded in the policy text.\n"
+        "An answer that omits one of these sections, or that queries the database, will be rejected."
+    )
+
+
 def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
+    if categories and categories[0].get("mode") == "rule":
+        return build_rule_context(categories)
     parts = []
     for c in categories:
         lines = []
@@ -248,6 +311,18 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
 
     missing_sections = [s for s in expected_sections if s not in in_answer]
     missing_in_sources = [s for s in expected_sections if s not in in_sources]
+
+    if categories and categories[0].get("mode") == "rule":
+        unexpected_sql = bool(sql.strip())
+        return {
+            "mode": "rule",
+            "expected_sections": expected_sections, "excluded_sections": [], "expected_columns": [],
+            "has_unverifiable": False,
+            "missing_sections": missing_sections, "missing_in_sources": missing_in_sources,
+            "unexpected_sections": [], "missing_columns": [], "multi_statement": False,
+            "forbidden_columns_used": [], "unexpected_sql": unexpected_sql,
+            "ok": not (missing_sections or missing_in_sources or unexpected_sql),
+        }
     unexpected_sections = [s for s in excluded_sections if s in in_answer or s in in_sources]
     missing_columns = [c for c in expected_columns if c not in sql] if (enforce_sql or sql) else []
     # the SQL must be ONE statement over the criteria only — no limit columns, no extra queries
@@ -257,10 +332,12 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool) ->
     forbidden_columns_used = [c for c in forbidden if re.search(r"\b" + c + r"\b", sql)] if sql else []
     has_unverifiable = any(c.get("unverifiable_sections") for c in categories)
     return {
+        "mode": "membership",
         "expected_sections": expected_sections,
         "excluded_sections": excluded_sections,
         "expected_columns": expected_columns,
         "has_unverifiable": has_unverifiable,
+        "unexpected_sql": False,
         "missing_sections": missing_sections,          # criterion sections not mentioned in the answer text
         "missing_in_sources": missing_in_sources,      # criterion sections not listed in policy_sources
         "unexpected_sections": unexpected_sections,    # limit-only sections that were wrongly included
@@ -279,6 +356,20 @@ def sanitize_policy_answer(data: dict, categories: list[dict], report: dict) -> 
     """
     notes = []
     excluded = report.get("excluded_sections", [])
+
+    if report.get("mode") == "rule":
+        # a rule question: the policy text is the answer; any SQL/table the model ran is noise
+        if (data.get("sql_query") or "").strip() or data.get("table_data"):
+            data["sql_query"] = ""
+            data["table_data"] = []
+            data["output_format"] = "text"
+            notes.append("dropped the database query/table (the question asks about the policy rule, not the data)")
+        if data.get("tool_used") in ("database", "hybrid"):
+            data["tool_used"] = "policy"
+        cov = data.get("data_coverage")
+        if isinstance(cov, dict):
+            cov["checked"], cov["missing"] = [], []
+        return notes
 
     # 1. SQL: keep only the first statement (the per-criterion count query)
     sql = data.get("sql_query") or ""
@@ -353,6 +444,10 @@ def build_correction(report: dict) -> str:
                 + ", ".join("Section " + s for s in report["unexpected_sections"]) + "\n")
     if report["missing_columns"]:
         msg += "- DB columns your SQL did not check: " + ", ".join(report["missing_columns"]) + "\n"
+    if report.get("unexpected_sql"):
+        msg += ("- This question asks what the POLICY says (a rule / limit), not about the portfolio: do NOT query "
+                "the database. Set sql_query to \"\", table_data to [], tool_used to \"policy\", and answer from the "
+                "policy sections with their exact figures.\n")
     if report.get("multi_statement"):
         msg += "- Your sql_query contains more than one statement. Return EXACTLY ONE SELECT statement.\n"
     if report.get("forbidden_columns_used"):

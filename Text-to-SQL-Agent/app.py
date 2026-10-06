@@ -587,7 +587,7 @@ def confidence_badge(score: int) -> str:
     )
 
 SQL_EXEC_TOOLS = {"sql_db_query"}   # the toolkit tool that actually runs SQL (not list_tables / schema / checker)
-_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_NUM_RE = re.compile(r"(?:(?<=^)|(?<=\s))-\d+(?:\.\d+)?|\d+(?:\.\d+)?")  # "כ-967" is not negative
 
 def _norm_sql(sql: str) -> str:
     return re.sub(r"\s+", " ", (sql or "").strip().rstrip(";")).strip().lower()
@@ -760,7 +760,7 @@ def run_agent(query: str, status=None) -> dict:
     timings = {}
     t0 = time.time()
     categories = detect_policy_categories(query, policy_chunks)
-    enforce_sql = wants_data(query)
+    enforce_sql = bool(categories) and categories[0].get("mode") == "membership"
     if categories:
         say(f"זוהתה קטגוריית מדיניות: {', '.join(c['label'] for c in categories)} — מזריק {sum(len(c['sections']) for c in categories)} סעיפים")
 

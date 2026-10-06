@@ -106,6 +106,9 @@ def validate(dataset, write_back=True):
             else:
                 q["expected_values"] = fn(**q["inputs"])
                 line += f"calc → {q['expected_values']}"
+                for k in q.get("required_values", []):
+                    if k not in q["expected_values"]:
+                        problems.append(f"{qid}: required value {k!r} is not produced by {q['expected_calculator']}")
 
         if qtype in ("policy", "hybrid"):
             for sid in q.get("expected_sections", []):

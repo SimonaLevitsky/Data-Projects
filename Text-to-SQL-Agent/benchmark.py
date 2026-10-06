@@ -45,7 +45,8 @@ REPORT_MD = os.path.join(BASE_DIR, "benchmark_report.md")
 RESULTS_JSON = os.path.join(BASE_DIR, "benchmark_results.json")
 
 CLARIFICATION_THRESHOLD = 70   # same as CONFIDENCE_THRESHOLD in app.py
-NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+# A leading minus counts only at the start or after whitespace: Hebrew prefixes like "כ-967" / "ל-5" are not negatives.
+NUM_RE = re.compile(r"(?:(?<=^)|(?<=\s))-\d+(?:\.\d+)?|\d+(?:\.\d+)?")
 SECTION_RE = re.compile(r"(?:§|section|sections|סעיף|סעיפים)\s*(\d+\.\d+)", re.IGNORECASE)
 
 
@@ -188,16 +189,24 @@ def score_question(q: dict, data: dict, counts_before: dict, counts_after: dict,
             gold_nums = [c for c in rows_g[0] if isinstance(c, (int, float))]
         else:
             gold_nums = [r[-1] for r in rows_g if r and isinstance(r[-1], (int, float))]
-        checks["answer_has_gold_values"] = all(number_present(float(v), numbers_in(answer)) for v in gold_nums) if gold_nums else True
+        # numbers visible to the user = prose + table cells (a "show table" answer keeps the values in table_data)
+        table_vals = [c for r in (data.get("table_data") or []) if isinstance(r, dict) for c in r.values()
+                      if isinstance(c, (int, float)) and not isinstance(c, bool)]
+        visible = numbers_in(answer) + [float(v) for v in table_vals]
+        checks["answer_has_gold_values"] = all(number_present(float(v), visible) for v in gold_nums) if gold_nums else True
+        if not checks["answer_has_gold_values"]:
+            details.append("gold values not shown to the user: " + ", ".join(str(v) for v in gold_nums if not number_present(float(v), visible)))
 
     if t == "calculator":
         nums = numbers_in(answer)
         expected = {k: v for k, v in (q.get("expected_values") or {}).items() if isinstance(v, (int, float))}
-        missing = [k for k, v in expected.items() if not number_present(float(v), nums)]
+        # only the values the question actually asks for are required; the rest are optional extras
+        required = [k for k in (q.get("required_values") or list(expected)) if k in expected]
+        missing = [k for k in required if not number_present(float(expected[k]), nums)]
         checks["calculator_accuracy"] = not missing
         checks["no_sql"] = sql == ""
         if missing:
-            details.append("missing values: " + ", ".join(f"{k}={expected[k]}" for k in missing))
+            details.append("missing required values: " + ", ".join(f"{k}={expected[k]}" for k in missing))
 
     if t in ("policy", "hybrid"):
         ids = section_ids(data.get("policy_sources"), answer)
@@ -295,7 +304,9 @@ def render_markdown(report: dict) -> str:
     if failed:
         out += ["", "## Failure details", ""]
         for r in failed:
+            failed_checks = ", ".join(k for k, ok in r["checks"].items() if not ok)
             out.append(f"- **{r['id']}** — {r['question']}")
+            out.append(f"  - failed checks: **{failed_checks}**")
             for d in r["details"]:
                 out.append(f"  - {d}")
             if r["sql_query"]:
