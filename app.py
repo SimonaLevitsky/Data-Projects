@@ -2,6 +2,8 @@ import os
 import re
 import json
 import math
+import time
+import sqlite3
 import pandas as pd
 import streamlit as st
 from langchain.agents import create_agent
@@ -9,7 +11,18 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from build_vector_db import load_or_build_index, load_policy_text, chunk_policy, POLICY_PATH
+from build_vector_db import load_or_build_index, load_policy_text, chunk_policy, POLICY_PATH, INDEX_DIR
+from policy_enforcement import (scan_policy, detect_policy_categories, build_policy_context,
+                                check_completeness, build_correction, wants_data,
+                                sanitize_policy_answer, final_confidence)
+
+APP_START = time.time()
+
+def startup_log(msg: str):
+    """Terminal-side trace of the startup phases (visible where `streamlit run` was launched)."""
+    print(f"[startup +{time.time() - APP_START:5.1f}s] {msg}", flush=True)
+
+startup_log("imports done")
 
 st.set_page_config(
     page_title="AI Credit Risk Assistant",
@@ -21,10 +34,12 @@ st.title("🤖 AI Credit Risk Assistant")
 st.markdown("Ask questions about the loan portfolio, request financial calculations, or consult the credit underwriting policy — the agent routes each question to the right tool (SQL, calculator, or policy retriever).")
 
 # --- API Key ---
+openai_api_key = None
 try:
-    openai_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    openai_api_key = st.secrets.get("OPENAI_API_KEY")
 except Exception:
-    openai_api_key = None
+    pass
+openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
 
 if not openai_api_key:
     st.error("שגיאה: מפתח ה-OPENAI_API_KEY לא נמצא.")
@@ -38,11 +53,13 @@ if not os.path.exists(db_path):
     st.error(f"שגיאה: קובץ מסד הנתונים '{db_path}' לא נמצא.")
     st.stop()
 
+startup_log("API key found; opening SQLite DB")
 db = SQLDatabase.from_uri(
     f"sqlite:///{db_path}",
     include_tables=["loans", "demographics"],
     sample_rows_in_table_info=2
 )
+startup_log("DB ready; parsing policy document (local, no network)")
 
 # --- Policy Vector Store (RAG) ---
 if not os.path.exists(POLICY_PATH):
@@ -52,16 +69,53 @@ if not os.path.exists(POLICY_PATH):
 @st.cache_resource(show_spinner="טוען את מאגר המדיניות (Vector DB)...")
 def get_policy_retriever(_api_key: str):
     """Load the FAISS index once per server process (built on first run if missing)."""
+    t0 = time.time()
+    existed = os.path.exists(os.path.join(INDEX_DIR, "index.faiss"))
     store = load_or_build_index(_api_key)
-    return store.as_retriever(search_kwargs={"k": 5})
+    info = {
+        "source": "loaded from disk" if existed else "BUILT now (OpenAI embeddings call)",
+        "vectors": store.index.ntotal,
+        "seconds": round(time.time() - t0, 1),
+    }
+    return store.as_retriever(search_kwargs={"k": 5}), info
 
 @st.cache_resource
 def get_policy_chunks():
     """All policy sub-sections in document order — used for exhaustive keyword scans."""
     return chunk_policy(load_policy_text())
 
-policy_retriever = get_policy_retriever(openai_api_key)
-policy_chunks = get_policy_chunks()
+def get_retriever():
+    """Lazy accessor: the FAISS index is loaded/built on the FIRST policy question, never at startup."""
+    retriever, info = get_policy_retriever(openai_api_key)
+    st.session_state["index_info"] = info
+    return retriever
+
+policy_chunks = get_policy_chunks()   # local text parsing only — no network
+startup_log("policy chunks ready (vector DB deferred to first policy question); building agent")
+
+# ── Sidebar diagnostics: where does the time go? ──
+with st.sidebar:
+    st.markdown("### 🔧 Diagnostics")
+    _info = st.session_state.get("index_info")
+    if _info:
+        st.caption(f"Vector DB: {_info['source']} · {_info['vectors']} vectors · {_info['seconds']}s")
+    elif os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
+        st.caption("Vector DB: on disk — loads on the first policy question")
+    else:
+        st.caption("Vector DB: not built yet — will be built on the first policy question (one OpenAI call)")
+    st.caption(f"Policy chunks: {len(policy_chunks)} · Startup: {round(time.time() - APP_START, 1)}s")
+    if st.button("Load / build vector DB now", help="Runs the OpenAI embeddings call explicitly and shows the time or the error."):
+        try:
+            _t = time.time()
+            get_retriever()
+            st.success(f"OK in {time.time() - _t:.1f}s — {st.session_state['index_info']['source']}")
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
+    _lt = st.session_state.get("last_timings")
+    if _lt:
+        st.markdown("**Last question**")
+        for k, v in _lt.items():
+            st.caption(f"{k}: {v}")
 
 # ─────────────────────────────────────────────
 # FINANCIAL CALCULATOR TOOLS
@@ -178,7 +232,7 @@ def search_credit_policy(query: str) -> str:
     NOTE: this is a similarity search — it returns the BEST matches, not necessarily ALL of them.
     When you need every section that mentions a specific category/term, use find_all_policy_mentions.
     """
-    docs = policy_retriever.invoke(query)
+    docs = get_retriever().invoke(query)
     passages = []
     for d in docs:
         m = d.metadata
@@ -195,12 +249,6 @@ def search_credit_policy(query: str) -> str:
     }, ensure_ascii=False)
 
 
-def _normalize_for_match(text: str) -> str:
-    """Lowercase, unify dashes/hyphens to spaces, collapse whitespace (so 'high-risk' == 'High Risk')."""
-    text = text.lower().replace("-", " ").replace("–", " ").replace("—", " ")
-    return re.sub(r"\s+", " ", text)
-
-
 @tool
 def find_all_policy_mentions(terms: str) -> str:
     """
@@ -215,25 +263,8 @@ def find_all_policy_mentions(terms: str) -> str:
     Typical flow: call this first → collect every criterion → then decide which criteria can be
     checked against the database and which cannot.
     """
+    matches = scan_policy(policy_chunks, terms)
     term_list = [t.strip() for t in re.split(r"[|,]", terms) if t.strip()]
-    norm_terms = [_normalize_for_match(t) for t in term_list]
-    matches = []
-    for d in policy_chunks:
-        m = d.metadata
-        if m.get("section") == "0":
-            continue
-        lines = d.page_content.split("\n")[1:]  # drop the "Section X — Y" header line
-        matching_lines = [
-            ln.strip() for ln in lines
-            if any(t in _normalize_for_match(ln) for t in norm_terms)
-        ]
-        if matching_lines:
-            matches.append({
-                "section": f"{m.get('subsection', '')} {m.get('subsection_title', '')}".strip(),
-                "parent_section": f"Section {m.get('section', '')}: {m.get('section_title', '')}",
-                "matching_lines": matching_lines,
-                "full_text": d.page_content
-            })
     return json.dumps({
         "tool": "policy_exhaustive_scan",
         "terms": term_list,
@@ -270,9 +301,11 @@ TOOL ROUTING — DECIDE BEFORE EVERY ANSWER:
    - find_all_policy_mentions(terms): EXHAUSTIVE scan — returns EVERY section mentioning a category/label.
      MANDATORY whenever the question names a policy-defined category (High Risk, Low Risk, Tier 1-4,
      Prime, Sub-Prime, Watch, Substandard, guarantor, collateral, Credit Committee, minimum income...).
-     A category is often defined in SEVERAL sections (e.g. "High Risk" appears in §2.1, §4.1 and §8.1);
+     A category is often defined in SEVERAL sections (e.g. "High Risk" appears in Sections 2.1, 4.1 and 8.1);
      a single semantic search would miss some of them, which makes the answer INCOMPLETE and WRONG.
-   Always cite the section numbers you relied on (e.g. "per policy §2.1").
+   Always cite the section numbers you relied on.
+   SECTION CITATION FORMAT — NEVER use the "§" sign. Write the word:
+     Hebrew answer → "סעיף 2.1" (plural: "סעיפים 2.1, 4.1 ו-8.1");  English answer → "Section 2.1".
    NEVER answer a policy question from memory — if you did not retrieve it, you do not know it.
 
 4. HYBRID → use when the question combines two or more tool types:
@@ -292,51 +325,71 @@ Trigger: the question asks to COUNT / LIST / MEASURE clients (or loans) using a 
 the POLICY defines (High Risk, Low Risk, Tier N, Prime, Sub-Prime, eligible/ineligible, preferred
 applicant, policy violation, within/above a policy limit, etc.).
 
-STEP 1 — COLLECT ALL CRITERIA (never skip, never rely on a single section):
+STEP 1 — COLLECT EVERY SECTION (never rely on a single section):
    Call find_all_policy_mentions with the label and its synonyms (e.g. "high risk|tier 4").
-   Optionally add search_credit_policy for related wording. Build the COMPLETE list of criteria the
-   policy attaches to that label, each with its section number.
+   A category is usually mentioned in SEVERAL sections.
 
-STEP 2 — MAP EACH CRITERION TO THE DATABASE SCHEMA. For every criterion decide:
-   ✔ CHECKABLE  — it maps to a column: credit_score, loan_amount, age, default_status,
-                  employment_years, annual_income, marital_status.
-   ✘ NOT IN DATA — it needs information the DB does not hold: guarantors, collateral, Credit Committee
-                  review, approval rates, missed payments, DTI, interest rate, bankruptcy, documentation,
-                  income sources, loan term, outstanding balance, etc.
-   Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it);
-   "above 200,000" → loan_amount > 200000. Always state the exact operator you used.
+STEP 2 — SPLIT THE SECTIONS INTO CRITERIA vs LIMITS:
+   ✔ CRITERION section = states WHO belongs to the category: a threshold on credit score, employment
+     years, income, age, DTI, missed payments, default status, marital status.
+     e.g. Section 2.1 "Tier 4 — High Risk (Score below 550)", Section 4.1 "0–1 years of employment: High risk".
+   ✘ LIMIT section = states what applies to clients who are ALREADY in the category: maximum loan amount,
+     guarantors, collateral, Credit Committee review, approval rate, max term.
+     e.g. Section 8.1 "Tier 4 (High Risk): Up to 50,000 ILS with two guarantors".
+   A question like "how many clients are <category>?" asks for the CRITERIA. LIMIT sections are NOT part
+   of the answer: do not mention them, do not count them, do not list them in policy_sources.
+   (A line that contains both a threshold and limits — like Section 2.1 — is a CRITERION section; use its
+   threshold and ignore its limits.)
 
-STEP 3 — RUN ONE SQL QUERY covering ALL checkable criteria, with a separate count per criterion,
-   a combined count (OR = meets ANY criterion), and the total, e.g.:
+STEP 3 — ONE CONDITION PER CRITERION SECTION, EACH COUNTED OVER THE WHOLE PORTFOLIO:
+   Boundary rules: "below 550" → credit_score < 550; "0–1 years" → employment_years < 1 (state it).
+   Run EXACTLY ONE SQL statement (never several queries separated by ';') with: one count per criterion,
+   ONE combined count = clients meeting AT LEAST ONE
+   criterion (OR over the criteria), and the total:
    SELECT
-     SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)                 AS tier4_score_below_550,
-     SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)               AS employment_under_1_year,
-     SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 THEN 1 ELSE 0 END) AS high_risk_any,
-     SUM(CASE WHEN l.credit_score < 550 AND l.loan_amount > 50000 THEN 1 ELSE 0 END) AS tier4_above_50k_limit,
+     SUM(CASE WHEN l.credit_score < 550 THEN 1 ELSE 0 END)                           AS score_below_550,
+     SUM(CASE WHEN d.employment_years < 1 THEN 1 ELSE 0 END)                         AS employment_under_1_year,
+     SUM(CASE WHEN l.credit_score < 550 OR d.employment_years < 1 THEN 1 ELSE 0 END) AS at_least_one_criterion,
      COUNT(*) AS total_clients
    FROM loans l JOIN demographics d ON l.client_id = d.client_id;
-   When the policy sets a LIMIT for the category (max loan amount, max term...), also count the clients
-   in that category who EXCEED the limit — these are potential policy violations and are highly valuable.
+   This rule is GENERAL: whenever a question involves several criteria, report each criterion separately,
+   then "at least one criterion", then the total. Never add AND-combinations or limit columns.
 
-STEP 4 — ANSWER STRUCTURE (in the user's language):
-   1. "According to the policy, <label> is defined by:" — bullet per criterion WITH its section (§x.y).
-      Include ALL sections found, even those that cannot be checked in the data.
-   2. "What was checked in the data:" — the numbers per checkable criterion + combined count + total.
-   3. "⚠️ Data limitations:" — list every criterion that could NOT be checked and WHY (which information
-      is missing from the DB). State clearly that the result is therefore PARTIAL / a lower bound.
-   4. Any boundary assumptions you made (e.g. employment_years < 1).
-   Fill "policy_sources" with ALL sections used, and "data_coverage" with the checked / missing lists.
-   confidence_score: 70-89 (policy-based interpretation + partial data). tool_used: "hybrid".
+STEP 4 — ANSWER STRUCTURE (STRICT — the UI renders these fields in a fixed layout):
+
+   "answer" = PART 1 ONLY — the policy definition:
+      Hebrew:  "לפי המדיניות, לקוחות בקטגוריית <label> מוגדרים על פי:"
+      English: "According to the policy, <label> clients are defined by:"
+      followed by ONE bullet PER CRITERION SECTION, in section order, ending with the section number:
+         * ציון אשראי מתחת ל-550 (סעיף 2.1).
+         * 0–1 שנות תעסוקה (סעיף 4.1).
+      NOTHING ELSE in "answer": no numbers, no counts, no limits. (If you made a boundary assumption,
+      add ONE short final line: "הנחה: ..." / "Assumption: ...".)
+
+   "table_data" = PART 2 — "what was checked in the data", rows {"מדד": "<label>", "ערך": <number>}
+      (English: {"Metric": ..., "Value": ...}), in THIS order:
+      1. one row per criterion, same order as the bullets:   "לקוחות עם ציון מתחת ל-550" → 28
+                                                              "לקוחות עם 0–1 שנות תעסוקה" → 4
+      2. "לקוחות שעומדים בלפחות קריטריון אחד" / "Clients meeting at least one criterion" → OR over the criteria
+      3. "סך כל הלקוחות" / "Total clients".
+      Exactly these rows — no extra rows.
+   output_format = "table+text"  (append "+sql" when the user asked for the query).
+
+   "data_coverage.checked" = the criteria you verified, each with its section.
+   "data_coverage.missing" = ONLY criteria that cannot be verified in the data (e.g. DTI, missed payments).
+      Leave it EMPTY when every criterion was verified. Never put limits (guarantors, amounts, committee) there.
+   "policy_sources" = exactly the criterion sections.  tool_used: "hybrid".
+   confidence_score: 90-100 when every criterion is defined by the policy AND verified in the DB (the normal
+   case — the answer is fully grounded); 70-89 only if a criterion could not be verified in the data.
    NEVER present a single-criterion count as "the" answer when the policy lists several criteria.
 
 WORKED EXAMPLE — "How many clients in the portfolio are High Risk according to the policy?"
-   → find_all_policy_mentions("high risk|tier 4") returns §2.1 (Tier 4: score below 550, Credit Committee
-     review, max 50,000 ILS, two guarantors, <15% approval), §4.1 (0–1 years employment: high risk,
-     loans restricted below 30,000 ILS), §8.1 (Tier 4: up to 50,000 ILS with two guarantors + Committee).
-   → Checkable: credit_score < 550 (§2.1/§8.1); employment_years < 1 (§4.1); loan_amount vs the
-     50,000 / 30,000 limits (violation check). Not in data: guarantors, Credit Committee review,
-     approval rate.
-   → Run the SQL from STEP 3, then answer with the 4-part structure above.
+   → find_all_policy_mentions("high risk|tier 4") returns Section 2.1 (Tier 4: score below 550 + limits),
+     Section 4.1 (0–1 years employment: high risk + a 30,000 ILS restriction), Section 8.1 (Tier 4 limits only).
+   → Criteria: credit_score < 550 (Section 2.1); employment_years < 1 (Section 4.1).
+     Section 8.1 is a LIMIT section → excluded from the answer entirely.
+   → Run the SQL from STEP 3; "answer" = 2 bullets; "table_data" = 2 criterion rows + "at least one
+     criterion" + total; data_coverage.missing = [] (both criteria verified).
 
 POLICY LOOKUP FOR VAGUE TERMS:
 When the user uses a vague qualifier (risky, high risk, young, experienced, large loan, good score, etc.),
@@ -359,15 +412,15 @@ Always return a valid JSON object with exactly these fields:
 
 {
   "answer": "Natural language finding in the user's language.",
-  "sql_query": "SQL executed, or empty string if no database query was run.",
+  "sql_query": "ALWAYS the exact final SQL you executed with sql_db_query — even when the user did NOT ask to see the query (the UI decides whether to display it). Empty string ONLY if no database query was run.",
   "tool_used": "<one of: database | calculator | policy | hybrid | none>",
   "confidence_score": <integer 0-100>,
   "output_format": "<one of: text | table | sql | text+sql | table+sql | table+text+sql>",
   "table_data": [ {"column": value, ...}, ... ],
   "policy_sources": [ "2.1 Credit Score Tiers", ... ],
   "data_coverage": {
-    "checked": [ "credit_score < 550 (§2.1)", ... ],
-    "missing": [ "Two guarantors required (§2.1) — guarantor data not in DB", ... ]
+    "checked": [ "credit_score < 550 (Section 2.1)", ... ],
+    "missing": [ "Two guarantors required (Section 2.1) — guarantor data not in DB", ... ]
   }
 }
 
@@ -419,7 +472,10 @@ OUT-OF-DOMAIN (recipes, weather, stocks, coding, personal questions, DB modifica
 # LLM, TOOLS & AGENT
 # ─────────────────────────────────────────────
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=openai_api_key)
+MODEL_NAME = "gpt-4o-mini"
+llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=openai_api_key, timeout=90, max_retries=2)
+st.session_state.setdefault("model_name", MODEL_NAME)
+AGENT_RECURSION_LIMIT = 30  # max agent steps (model calls + tool calls) per attempt — prevents endless tool loops
 
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 sql_tools = toolkit.get_tools()
@@ -431,6 +487,7 @@ agent = create_agent(
     tools=sql_tools + calculator_tools + policy_tools,
     system_prompt=SYSTEM_PROMPT
 )
+startup_log("agent ready; rendering UI")
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -488,8 +545,63 @@ def confidence_badge(score: int) -> str:
         f'{label} confidence ({score}%)</span>'
     )
 
-def run_agent(query: str) -> dict:
-    result = agent.invoke({"messages": [("human", query)]})
+SQL_EXEC_TOOLS = {"sql_db_query"}   # the toolkit tool that actually runs SQL (not list_tables / schema / checker)
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+def _norm_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", (sql or "").strip().rstrip(";")).strip().lower()
+
+def _nums(text: str) -> list[float]:
+    return [float(x) for x in _NUM_RE.findall(str(text).replace(",", ""))]
+
+def executed_sql_calls(messages: list) -> list[dict]:
+    """
+    Every sql_db_query call in the agent trace, in order: {"query", "ok", "result"}.
+    `ok` is False when the tool returned an error. This is the ground truth of what really ran.
+    """
+    calls, order = {}, []
+    for m in messages:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            if tc.get("name") in SQL_EXEC_TOOLS:
+                q = str((tc.get("args") or {}).get("query") or "").strip()
+                if q:
+                    calls[tc.get("id")] = {"query": q, "ok": True, "result": ""}
+                    order.append(tc.get("id"))
+        if getattr(m, "type", "") == "tool" and getattr(m, "tool_call_id", None) in calls:
+            content = str(getattr(m, "content", "")).strip()
+            calls[m.tool_call_id]["result"] = content
+            if content.lower().startswith("error") or "operationalerror" in content.lower():
+                calls[m.tool_call_id]["ok"] = False
+    return [calls[c] for c in order]
+
+
+def select_final_sql(messages: list, reported: str, answer: str) -> tuple[str, str]:
+    """
+    Decide which SQL is "the" query behind the answer. Returns (sql, how).
+      1. The model reported a query and it is one of the executed queries → the report (canonical form).
+      2. The model reported a query that is not in the trace (cleaned/paraphrased) → keep the report.
+      3. No report → among the successful executed queries, the one whose RESULT shares the most
+         numbers with the answer text (the agent often runs extra exploratory queries, e.g. a COUNT,
+         after the real one, so "the last query" is not a safe choice). Ties → the later query.
+    """
+    calls = [c for c in executed_sql_calls(messages) if c["ok"]]
+    rep = (reported or "").strip()
+    if rep:
+        for c in calls:
+            if _norm_sql(c["query"]) == _norm_sql(rep):
+                return rep, "reported (verified in trace)"
+        return rep, "reported"
+    if not calls:
+        return "", "none"
+    ans_nums = _nums(answer)
+    def overlap(c):
+        res_nums = _nums(c["result"])
+        return sum(1 for a in ans_nums if any(abs(a - r) <= max(abs(a) * 0.005, 0.01) for r in res_nums))
+    best = max(range(len(calls)), key=lambda i: (overlap(calls[i]), i))
+    return calls[best]["query"], ("trace (result matches answer)" if overlap(calls[best]) > 0 else "trace (last query)")
+
+
+def parse_agent_output(result: dict) -> dict:
     messages = result.get("messages", [])
     raw = messages[-1].content if messages else ""
     try:
@@ -503,16 +615,228 @@ def run_agent(query: str) -> dict:
         data.setdefault("table_data", [])
         data.setdefault("policy_sources", [])
         data.setdefault("data_coverage", {"checked": [], "missing": []})
-        return data
+        data = strip_section_sign(data)
     except (json.JSONDecodeError, AttributeError):
-        return {
+        data = {
             "answer": raw or "לא התקבלה תשובה מהסוכן.",
             "sql_query": "", "tool_used": "database",
             "confidence_score": 50, "output_format": "text", "table_data": [],
             "policy_sources": [], "data_coverage": {"checked": [], "missing": []}
         }
 
+    reported = (data.get("sql_query") or "").strip()
+    sql, how = select_final_sql(messages, reported, data.get("answer", ""))
+    if sql:
+        data["sql_query"] = sql
+        data["sql_source"] = how
+        if not reported:
+            data["sql_recovered_from_trace"] = True
+    return data
+
+# ── Deterministic output-format requests ───────────────────────────────────────────────
+# The model often sets output_format = "text" even when the user wrote "תציג שאילתה" / "הצג טבלה".
+# The display decision is taken from the user's words, not from the model's self-report.
+WANTS_SQL_RE   = re.compile(r"שאילת|\bsql\b|\bquery\b|קוד", re.IGNORECASE)
+WANTS_TABLE_RE = re.compile(r"טבל|\btable\b", re.IGNORECASE)
+MAX_TABLE_ROWS = 200
+
+def run_sql_readonly(sql: str) -> list[dict]:
+    """Execute ONE SELECT on a read-only connection and return rows as dicts (for building a table)."""
+    stmt = next((p.strip() for p in (sql or "").split(";") if p.strip()), "")
+    if not stmt or not stmt.lower().startswith(("select", "with")):
+        return []
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cur = con.execute(stmt)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchmany(MAX_TABLE_ROWS)]
+    finally:
+        con.close()
+
+def apply_format_requests(query: str, data: dict) -> dict:
+    """Force the SQL expander / table on when the question asked for them, whatever the model chose."""
+    parts = [p for p in str(data.get("output_format", "text")).split("+") if p]
+    changed = []
+    if WANTS_SQL_RE.search(query) and (data.get("sql_query") or "").strip() and "sql" not in parts:
+        parts.append("sql"); changed.append("sql")
+    if WANTS_TABLE_RE.search(query):
+        if not data.get("table_data") and (data.get("sql_query") or "").strip():
+            try:
+                rows = run_sql_readonly(data["sql_query"])
+            except Exception:
+                rows = []
+            if rows:
+                data["table_data"] = rows
+                data["table_built_from_sql"] = True
+                changed.append("table(built from SQL)")
+        if data.get("table_data") and "table" not in parts:
+            parts.append("table")
+            if "table(built from SQL)" not in changed:
+                changed.append("table")
+    if changed:
+        data["output_format"] = "+".join(parts)
+        data["format_forced"] = changed
+    return data
+
+MAX_COMPLETENESS_RETRIES = 1  # one automatic correction round if the answer is incomplete
+
+def _invoke_agent(messages: list) -> dict:
+    """One bounded agent run. Raises on timeout / step-limit so the UI can show it instead of hanging."""
+    return agent.invoke({"messages": messages}, config={"recursion_limit": AGENT_RECURSION_LIMIT})
+
+
+def run_agent(query: str, status=None) -> dict:
+    """
+    Run the agent. If the question mentions a policy-defined category (High Risk, Tier 4, Prime...):
+      1. inject ALL the policy sections for that category into the agent's input,
+      2. validate the answer (every section cited, every checkable column in the SQL),
+      3. retry once with a correction message if something is missing.
+    The verdict is attached under data["_completeness"] and surfaced in the UI.
+    `status` is an optional st.status container used to show progress and timings.
+    """
+    def say(msg):
+        if status is not None:
+            status.update(label=msg)
+            status.write(f"{time.strftime('%H:%M:%S')} — {msg}")
+
+    timings = {}
+    t0 = time.time()
+    categories = detect_policy_categories(query, policy_chunks)
+    enforce_sql = wants_data(query)
+    if categories:
+        say(f"זוהתה קטגוריית מדיניות: {', '.join(c['label'] for c in categories)} — מזריק {sum(len(c['sections']) for c in categories)} סעיפים")
+
+    agent_input = query + build_policy_context(categories, enforce_sql) if categories else query
+    say("מריץ את הסוכן (ניסיון 1)...")
+    t1 = time.time()
+    result = _invoke_agent([("human", agent_input)])
+    timings["attempt 1"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
+    data = parse_agent_output(result)
+
+    if not categories:
+        timings["total"] = f"{time.time() - t0:.1f}s"
+        st.session_state["last_timings"] = timings
+        return apply_format_requests(query, data)
+
+    retries = 0
+    report = check_completeness(data, categories, enforce_sql)
+    while not report["ok"] and retries < MAX_COMPLETENESS_RETRIES:
+        retries += 1
+        say(f"בדיקת שלמות נכשלה (חסר: {report['missing_sections'] + report['missing_columns']}) — סבב תיקון {retries}...")
+        t1 = time.time()
+        result = _invoke_agent(result["messages"] + [("human", build_correction(report))])
+        timings[f"correction {retries}"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
+        data = parse_agent_output(result)
+        report = check_completeness(data, categories, enforce_sql)
+
+    # Deterministic clean-up of whatever the model still got wrong, then re-check the cleaned answer
+    cleaned = sanitize_policy_answer(data, categories, report)
+    if cleaned:
+        say("ניקוי אוטומטי: " + "; ".join(cleaned))
+        report = check_completeness(data, categories, enforce_sql)
+    data["confidence_score"] = final_confidence(data, report)
+
+    say("בדיקת שלמות עברה ✅" if report["ok"] else "בדיקת שלמות עדיין נכשלת — מציג תשובה חלקית ⚠️")
+    data["_completeness"] = {
+        "categories": [c["label"] for c in categories],
+        "retries": retries,
+        "cleaned": cleaned,
+        **report,
+    }
+    timings["total"] = f"{time.time() - t0:.1f}s"
+    st.session_state["last_timings"] = timings
+    return apply_format_requests(query, data)
+
 CONFIDENCE_THRESHOLD = 70  # מתחת לסף זה → לא מציגים תשובה, רק בקשת הבהרה
+
+def section_label(source: str, hebrew: bool) -> str:
+    """'2.1 Credit Score Tiers' → 'סעיף 2.1 Credit Score Tiers' / 'Section 2.1 Credit Score Tiers'."""
+    s = re.sub(r"^\s*(§|section|סעיף)?\s*", "", str(source), flags=re.IGNORECASE)
+    return ("סעיף " if hebrew else "Section ") + s
+
+def strip_section_sign(data: dict) -> dict:
+    """Safety net: the model must not emit '§' — replace it with the word in the answer's language."""
+    word = "סעיף " if is_hebrew(data.get("answer", "")) else "Section "
+    data["answer"] = re.sub(r"§\s*", word, data.get("answer", "") or "")
+    data["policy_sources"] = [re.sub(r"^\s*§\s*", "", str(s)) for s in data.get("policy_sources", []) or []]
+    cov = data.get("data_coverage")
+    if isinstance(cov, dict):
+        for k in ("checked", "missing"):
+            cov[k] = [re.sub(r"§\s*", word, str(x)) for x in cov.get(k, []) or []]
+    return data
+
+COMBINED_ROW_RE = re.compile(r"לפחות קריטריון|at least one", re.IGNORECASE)
+TOTAL_ROW_RE    = re.compile(r"סך|סה\"כ|total", re.IGNORECASE)
+
+def order_policy_rows(rows: list) -> list:
+    """Enforce the fixed order: per-section rows → 'at least one criterion' → total (stable sort)."""
+    def rank(r):
+        label = str(next(iter(r.values()), "")) if isinstance(r, dict) and r else ""
+        if TOTAL_ROW_RE.search(label):
+            return 2
+        if COMBINED_ROW_RE.search(label):
+            return 1
+        return 0
+    return sorted(rows, key=rank)
+
+def markdown_table(rows: list) -> str:
+    cols = list(rows[0].keys())
+    esc = lambda v: str(v).replace("|", "/")
+    lines = ["| " + " | ".join(esc(c) for c in cols) + " |", "|" + "---|" * len(cols)]
+    lines += ["| " + " | ".join(esc(r.get(c, "")) for c in cols) + " |" for r in rows]
+    return "\n".join(lines)
+
+def render_policy_answer(answer: str, table_data: list, missing: list):
+    """Fixed layout for policy-category answers: definition → 'checked in the data' table → limitations."""
+    hebrew = is_hebrew(answer) or any(is_hebrew(str(v)) for r in table_data if isinstance(r, dict) for v in r.values())
+    rtl_markdown(answer)
+
+    rows = order_policy_rows([r for r in table_data if isinstance(r, dict) and r])
+    if rows:
+        header = "**מה שנבדק בנתונים:**" if hebrew else "**What was checked in the data:**"
+        if hebrew:
+            rtl_markdown(header + "\n\n" + markdown_table(rows))
+        else:
+            st.markdown(header)
+            try:
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            except Exception:
+                st.write(rows)
+
+    if missing:
+        title = "**⚠️ קריטריונים שלא ניתן לבדוק בנתונים:**" if hebrew else "**⚠️ Criteria that cannot be verified in the data:**"
+        rtl_markdown(title + "\n\n" + "\n".join(f"- {m}" for m in missing))
+
+def render_completeness(comp):
+    """Show the verdict of the Python-level policy completeness check (if the question triggered it)."""
+    if not comp:
+        return
+    cats = ", ".join(comp.get("categories", []))
+    secs = "Sections " + ", ".join(comp.get("expected_sections", []))
+    if comp.get("cleaned"):
+        st.caption("🧹 Auto-cleaned: " + "; ".join(comp["cleaned"]) + ".")
+    if not comp.get("ok"):
+        parts = []
+        if comp.get("missing_sections"):
+            parts.append("policy sections not covered: " + ", ".join(comp["missing_sections"]))
+        if comp.get("missing_columns"):
+            parts.append("criteria not checked in SQL: " + ", ".join(comp["missing_columns"]))
+        if comp.get("missing_in_sources") and not comp.get("missing_sections"):
+            parts.append("sections missing from the sources list: " + ", ".join(comp["missing_in_sources"]))
+        if comp.get("unexpected_sections"):
+            parts.append("limit-only sections wrongly included: " + ", ".join(comp["unexpected_sections"]))
+        if comp.get("multi_statement"):
+            parts.append("SQL contains more than one statement")
+        if comp.get("forbidden_columns_used"):
+            parts.append("SQL uses limit columns: " + ", ".join(comp["forbidden_columns_used"]))
+        st.warning(
+            f"⚠️ **Completeness check failed — treat this answer as PARTIAL.** "
+            f"The policy defines *{cats}* in {secs}. " + "; ".join(parts) + "."
+        )
+    elif comp.get("retries"):
+        st.caption(f"🔁 Answer regenerated after an automatic completeness check — now covers {secs} for *{cats}*.")
+    else:
+        st.caption(f"✅ Completeness check passed — covers {secs} for *{cats}*.")
 
 def render_response(data: dict):
     fmt          = data.get("output_format", "text")
@@ -525,6 +849,7 @@ def render_response(data: dict):
     coverage     = data.get("data_coverage") or {}
     checked      = coverage.get("checked", []) or [] if isinstance(coverage, dict) else []
     missing      = coverage.get("missing", []) or [] if isinstance(coverage, dict) else []
+    comp         = data.get("_completeness")
 
     # ── PYTHON-LEVEL ENFORCEMENT: confidence < threshold ──────────────────
     # גם אם הסוכן "שכח" לבקש הבהרה בפרומפט — הקוד מאכף
@@ -538,6 +863,7 @@ def render_response(data: dict):
             )
         else:
             st.warning(f"⚠️ **Confidence too low to answer ({confidence}%).**\n\n{body}")
+        render_completeness(comp)
         # Confidence badge בלבד — ללא תוצאה, ללא SQL
         st.markdown(confidence_badge(confidence), unsafe_allow_html=True)
         st.progress(confidence / 100)
@@ -550,19 +876,29 @@ def render_response(data: dict):
 
     # ── confidence ≥ threshold: מציגים תשובה מלאה ───────────────────────
 
-    # תשובה מילולית
-    if answer and ("text" in fmt or "table" not in fmt):
-        rtl_markdown(answer)
+    is_policy_answer = bool(comp) and bool(table_data)
 
-    # טבלה
-    if "table" in fmt:
-        if table_data:
-            try:
-                st.dataframe(pd.DataFrame(table_data), use_container_width=True)
-            except Exception:
-                st.write(table_data)
-        elif answer:
+    if is_policy_answer:
+        # Fixed layout: 1) policy definition  2) "checked in the data" table  3) data limitations
+        render_policy_answer(answer, table_data, missing)
+    else:
+        # תשובה מילולית
+        if answer and ("text" in fmt or "table" not in fmt):
             rtl_markdown(answer)
+
+        # טבלה
+        if "table" in fmt:
+            if table_data:
+                try:
+                    st.dataframe(pd.DataFrame(table_data), width="stretch")
+                except Exception:
+                    st.write(table_data)
+                if data.get("table_built_from_sql"):
+                    st.caption("Table built by running the agent's SQL (the model returned no table_data).")
+            elif answer:
+                rtl_markdown(answer)
+
+    render_completeness(comp)
 
     # Badges row
     badges_html = tool_badge(tool_used) + "&nbsp;&nbsp;" + confidence_badge(confidence)
@@ -573,22 +909,26 @@ def render_response(data: dict):
     if "sql" in fmt and sql_query:
         with st.expander("🔍 SQL Query"):
             st.code(sql_query, language="sql")
+            if data.get("sql_recovered_from_trace"):
+                st.caption("Recovered from the agent's tool calls (the model left sql_query empty).")
 
     # Policy sources expander (RAG transparency)
     if sources:
         with st.expander(f"📜 Policy sources ({len(sources)})"):
             for s in sources:
-                st.markdown(f"- §{s}")
+                rtl_markdown(f"- {section_label(s, hebrew=is_hebrew(answer))}")
 
     # Data coverage expander — what was verified in the DB vs. what the data cannot answer
-    if checked or missing:
-        with st.expander(f"📊 Data coverage — checked: {len(checked)} · missing: {len(missing)}", expanded=bool(missing)):
+    # (for policy answers the "missing" part is already shown inline under the table)
+    show_missing = [] if is_policy_answer else missing
+    if checked or show_missing:
+        with st.expander(f"📊 Data coverage — checked: {len(checked)} · missing: {len(missing)}", expanded=bool(show_missing)):
             if checked:
                 st.markdown("**✔ Checked against the database:**")
                 rtl_markdown("\n".join(f"- {c}" for c in checked))
-            if missing:
+            if show_missing:
                 st.markdown("**✘ Not available in the database (partial answer):**")
-                rtl_markdown("\n".join(f"- {m}" for m in missing))
+                rtl_markdown("\n".join(f"- {m}" for m in show_missing))
 
 # ─────────────────────────────────────────────
 # UI
@@ -629,12 +969,14 @@ if user_query:
         rtl_markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("מנתח את הנתונים..."):
+        with st.status("מנתח את הנתונים...", expanded=False) as status:
             try:
-                data = run_agent(user_query)
+                data = run_agent(user_query, status=status)
+                status.update(label="הניתוח הושלם", state="complete")
             except Exception as e:
+                status.update(label=f"שגיאה: {type(e).__name__}", state="error")
                 data = {
-                    "answer": f"אופס, אירעה שגיאה: {e}",
+                    "answer": f"אופס, אירעה שגיאה ({type(e).__name__}): {e}",
                     "sql_query": "", "tool_used": "none",
                     "confidence_score": 0, "output_format": "text", "table_data": []
                 }
@@ -645,3 +987,40 @@ if user_query:
             "content": data.get("answer", ""),
             "data": data
         })
+
+# ─────────────────────────────────────────────
+# BENCHMARK (golden dataset) — runs the real run_agent in-process, scores with benchmark.py
+# ─────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 📊 Benchmark")
+    st.caption("Golden dataset: 15 core + 3 poison questions. Takes a few minutes.")
+    if st.button("Run benchmark", help="Runs every golden question through the agent and scores it (BIRD-style Execution Accuracy, routing, policy, rejection)."):
+        from benchmark import load_dataset, run_benchmark, build_report, render_markdown
+        _questions = load_dataset()["questions"]
+        _prog = st.progress(0.0, text="Starting benchmark…")
+
+        def _run(question: str):
+            _t = time.time()
+            return run_agent(question), time.time() - _t
+
+        def _progress(i, n, q):
+            _prog.progress((i - 1) / n, text=f"{q['id']} ({i}/{n}) — {q['type']}")
+
+        _results = run_benchmark(_run, _questions, progress=_progress)
+        _prog.progress(1.0, text="Done")
+        _report = build_report(_results, {"runner": "in-app", "model": MODEL_NAME})
+        st.session_state["benchmark_report_md"] = render_markdown(_report)
+        st.session_state["benchmark_report_json"] = json.dumps(_report, ensure_ascii=False, indent=2, default=str)
+
+if st.session_state.get("benchmark_report_md"):
+    with st.expander("📊 Benchmark report", expanded=True):
+        st.markdown(st.session_state["benchmark_report_md"])
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("⬇️ report (.md)", st.session_state["benchmark_report_md"], "benchmark_report.md", "text/markdown")
+        c2.download_button("⬇️ results (.json)", st.session_state["benchmark_report_json"], "benchmark_results.json", "application/json")
+        if c3.button("Clear report"):
+            st.session_state.pop("benchmark_report_md", None)
+            st.session_state.pop("benchmark_report_json", None)
+            st.rerun()
