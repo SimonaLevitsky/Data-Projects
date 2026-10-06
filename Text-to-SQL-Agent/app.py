@@ -140,6 +140,16 @@ with st.sidebar:
             st.success(f"OK in {time.time() - _t:.1f}s — {st.session_state['index_info']['source']}")
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
+    with st.expander("ℹ️ איך לקרוא את ציון הביטחון"):
+        st.markdown(
+            '<div dir="rtl" style="direction: rtl; text-align: right; font-size: 0.85em;">\n\n'
+            "- **90–100** — שאלה חד-משמעית, התאמה מדויקת לנתונים או למדיניות.\n"
+            "- **70–89** — נדרשה פרשנות קלה, ההנחה מצוינת בתשובה.\n"
+            "- **50–69** — שאלה עמומה. התשובה חסומה, מוצגת בקשת הבהרה.\n"
+            "- **0** — מחוץ לתחום או נתון שאינו קיים במערכת.\n\n"
+            "הסף של 70 נאכף בקוד, לא רק על ידי המודל.\n\n</div>",
+            unsafe_allow_html=True,
+        )
     _lt = st.session_state.get("last_timings")
     if _lt:
         st.markdown("**Last question**")
