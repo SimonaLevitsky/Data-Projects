@@ -3,6 +3,7 @@ import re
 import json
 import math
 import time
+import sqlite3
 import pandas as pd
 import streamlit as st
 from langchain.agents import create_agent
@@ -604,6 +605,51 @@ def parse_agent_output(result: dict) -> dict:
             data["sql_recovered_from_trace"] = True
     return data
 
+# ── Deterministic output-format requests ───────────────────────────────────────────────
+# The model often sets output_format = "text" even when the user wrote "תציג שאילתה" / "הצג טבלה".
+# The display decision is taken from the user's words, not from the model's self-report.
+WANTS_SQL_RE   = re.compile(r"שאילת|\bsql\b|\bquery\b|קוד", re.IGNORECASE)
+WANTS_TABLE_RE = re.compile(r"טבל|\btable\b", re.IGNORECASE)
+MAX_TABLE_ROWS = 200
+
+def run_sql_readonly(sql: str) -> list[dict]:
+    """Execute ONE SELECT on a read-only connection and return rows as dicts (for building a table)."""
+    stmt = next((p.strip() for p in (sql or "").split(";") if p.strip()), "")
+    if not stmt or not stmt.lower().startswith(("select", "with")):
+        return []
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cur = con.execute(stmt)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchmany(MAX_TABLE_ROWS)]
+    finally:
+        con.close()
+
+def apply_format_requests(query: str, data: dict) -> dict:
+    """Force the SQL expander / table on when the question asked for them, whatever the model chose."""
+    parts = [p for p in str(data.get("output_format", "text")).split("+") if p]
+    changed = []
+    if WANTS_SQL_RE.search(query) and (data.get("sql_query") or "").strip() and "sql" not in parts:
+        parts.append("sql"); changed.append("sql")
+    if WANTS_TABLE_RE.search(query):
+        if not data.get("table_data") and (data.get("sql_query") or "").strip():
+            try:
+                rows = run_sql_readonly(data["sql_query"])
+            except Exception:
+                rows = []
+            if rows:
+                data["table_data"] = rows
+                data["table_built_from_sql"] = True
+                changed.append("table(built from SQL)")
+        if data.get("table_data") and "table" not in parts:
+            parts.append("table")
+            if "table(built from SQL)" not in changed:
+                changed.append("table")
+    if changed:
+        data["output_format"] = "+".join(parts)
+        data["format_forced"] = changed
+    return data
+
 MAX_COMPLETENESS_RETRIES = 1  # one automatic correction round if the answer is incomplete
 
 def _invoke_agent(messages: list) -> dict:
@@ -642,7 +688,7 @@ def run_agent(query: str, status=None) -> dict:
     if not categories:
         timings["total"] = f"{time.time() - t0:.1f}s"
         st.session_state["last_timings"] = timings
-        return data
+        return apply_format_requests(query, data)
 
     retries = 0
     report = check_completeness(data, categories, enforce_sql)
@@ -671,7 +717,7 @@ def run_agent(query: str, status=None) -> dict:
     }
     timings["total"] = f"{time.time() - t0:.1f}s"
     st.session_state["last_timings"] = timings
-    return data
+    return apply_format_requests(query, data)
 
 CONFIDENCE_THRESHOLD = 70  # מתחת לסף זה → לא מציגים תשובה, רק בקשת הבהרה
 
@@ -725,7 +771,7 @@ def render_policy_answer(answer: str, table_data: list, missing: list):
         else:
             st.markdown(header)
             try:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             except Exception:
                 st.write(rows)
 
@@ -816,9 +862,11 @@ def render_response(data: dict):
         if "table" in fmt:
             if table_data:
                 try:
-                    st.dataframe(pd.DataFrame(table_data), use_container_width=True)
+                    st.dataframe(pd.DataFrame(table_data), width="stretch")
                 except Exception:
                     st.write(table_data)
+                if data.get("table_built_from_sql"):
+                    st.caption("Table built by running the agent's SQL (the model returned no table_data).")
             elif answer:
                 rtl_markdown(answer)
 
