@@ -21,6 +21,46 @@ No Streamlit / OpenAI dependency — fully testable offline.
 import re
 import json
 
+# Bumped whenever app.py starts relying on a new function/signature here. app.py checks it at startup so a
+# half-updated deployment (new app.py + old policy_enforcement.py) fails with a clear message, not a TypeError.
+ENFORCEMENT_VERSION = 3
+
+# Does the question refer to the policy / a rule / a policy-defined concept? If not, the policy tools are
+# unnecessary for it (plain portfolio statistics) and a "hybrid" routing is normalised back to "database".
+POLICY_INTENT_RE = re.compile(
+    r"מדיניות|policy|\bכלל|rule|תקר|מגבל|דריש|requir|limit|eligib|זכא|tier|prime|guarantor|ערב|collateral|בטוח|"
+    r"committee|ועד|risk|סיכון|מסוכן|underwrit|חיתום",
+    re.IGNORECASE)
+
+# Vague qualifiers with no numeric threshold in the question and no policy definition → ask, don't guess.
+AMBIGUOUS_TERMS_RE = re.compile(
+    r"גדול[הים]*|קטנ[הים]*|גבוה[הים]*|נמוכ[הים]*|צעיר[הים]*|מבוגר[הים]*|ותיק[הים]*|הרבה|מעט|טוב[הים]*|חזק[הים]*|בעייתי[הים]*|"
+    r"\b(large|big|small|high|low|young|old|experienced|many|few|good|strong|problematic)\b",
+    re.IGNORECASE)
+SUPERLATIVE_RE = re.compile(r"ביותר|הכי|\b(most|highest|lowest|largest|smallest|biggest|oldest|youngest|top)\b", re.IGNORECASE)
+
+def ambiguous_term(question: str, categories: list | None = None) -> str | None:
+    """
+    The vague term that makes the question unanswerable without a threshold, or None.
+    Not ambiguous when: the question carries a number, uses a superlative ("הגבוה ביותר"),
+    or the term is a policy-defined category (handled by the policy pipeline).
+    """
+    if categories:
+        return None
+    if re.search(r"\d", question) or SUPERLATIVE_RE.search(question):
+        return None
+    m = AMBIGUOUS_TERMS_RE.search(question)
+    return m.group(0) if m else None
+
+def clarification_for(term: str, question: str) -> str:
+    hebrew = bool(re.search(r"[֐-׿]", question))
+    if hebrew:
+        return (f"❓ המונח \"{term}\" אינו מוגדר במדיניות ואין לו סף מספרי בשאלה. "
+                f"אנא ציינו סף מדויק (למשל: \"{term} = מעל 100,000 ₪\" או \"מעל 700\") כדי שאוכל להריץ את הניתוח הנכון.")
+    return (f"❓ The term \"{term}\" has no numeric threshold in the question and no definition in the policy. "
+            f"Please specify a threshold (e.g. \"{term} = above 100,000\") so I can run the right analysis.")
+
+
 # Columns that exist in the database (loans ⨝ demographics)
 CHECKABLE_COLUMNS = ["credit_score", "loan_amount", "age", "default_status",
                      "employment_years", "annual_income", "marital_status"]
@@ -86,7 +126,9 @@ def normalize_for_match(text: str) -> str:
 
 # Columns/rows the user did not ask for: percentages, shares, ratios.
 RATIO_Q_RE      = re.compile(r"אחוז|שיעור|percent|share|ratio|\brate\b", re.IGNORECASE)
-RATIO_EXPR_RE   = re.compile(r"/|\*\s*100|\b(percent|percentage|share|ratio|rate|pct)\b", re.IGNORECASE)
+RATIO_EXPR_RE   = re.compile(
+    r"/|\*\s*100(?:\.0+)?\b|\b100(?:\.0+)?\s*\*|(?:^|[\s_(])(?:percent|percentage|share|ratio|rate|pct)(?:$|[\s_),])",
+    re.IGNORECASE)
 COMBINED_LABEL_RE = re.compile(r"לפחות קריטריון|at least one", re.IGNORECASE)
 
 def asks_ratio(question: str) -> bool:

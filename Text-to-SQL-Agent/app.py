@@ -12,9 +12,13 @@ from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from build_vector_db import load_or_build_index, load_policy_text, chunk_policy, POLICY_PATH, INDEX_DIR
+import policy_enforcement
 from policy_enforcement import (scan_policy, detect_policy_categories, build_policy_context,
                                 check_completeness, build_correction, wants_data,
-                                sanitize_policy_answer, final_confidence)
+                                sanitize_policy_answer, final_confidence,
+                                asks_ratio, RATIO_EXPR_RE, POLICY_INTENT_RE, ambiguous_term, clarification_for)
+
+REQUIRED_ENFORCEMENT_VERSION = 3
 
 APP_START = time.time()
 
@@ -23,6 +27,14 @@ def startup_log(msg: str):
     print(f"[startup +{time.time() - APP_START:5.1f}s] {msg}", flush=True)
 
 startup_log("imports done")
+
+if getattr(policy_enforcement, "ENFORCEMENT_VERSION", 0) != REQUIRED_ENFORCEMENT_VERSION:
+    st.error(
+        f"שגיאת גרסאות: app.py דורש policy_enforcement.py גרסה {REQUIRED_ENFORCEMENT_VERSION}, "
+        f"אבל נטענה גרסה {getattr(policy_enforcement, 'ENFORCEMENT_VERSION', 'ישנה (ללא מספר)')}. "
+        "יש להעלות את שני הקבצים app.py ו-policy_enforcement.py יחד."
+    )
+    st.stop()
 
 st.set_page_config(
     page_title="AI Credit Risk Assistant",
@@ -312,7 +324,9 @@ TOOL ROUTING — DECIDE BEFORE EVERY ANSWER:
    - calculate_compound_interest: "If I invest $10,000 at 4% for 10 years, what do I get?"
    - calculate_debt_to_income: "Is a client with $3,000/month income and $900/month payments eligible?"
 
-3. POLICY TOOLS → use for questions about RULES, not data:
+3. POLICY TOOLS → use ONLY when the question refers to the policy, a rule / limit / requirement, or a
+   policy-defined category (High Risk, Tier N, Prime, eligibility...). For plain portfolio statistics
+   (rates, averages, counts by a column) use the DATABASE ONLY — do not consult the policy "for context".
    - search_credit_policy(query): semantic search — best for "what does the policy say about X?"
      "What is the maximum DTI?", "How does the policy treat divorced applicants?", "When is a loan written off?"
    - find_all_policy_mentions(terms): EXHAUSTIVE scan — returns EVERY section mentioning a category/label.
@@ -685,7 +699,7 @@ AGG_QUESTION_RE = re.compile(
 AGG_SQL_RE   = re.compile(r"\b(avg|sum|count|min|max|group\s+by)\b", re.IGNORECASE)
 TOPN_SQL_RE  = re.compile(r"order\s+by[\s\S]*\blimit\b", re.IGNORECASE)
 
-def sql_sanity_issue(query: str, data: dict) -> str | None:
+def sql_sanity_issue(query: str, data: dict, messages: list | None = None) -> str | None:
     """Return a reason string when the SQL cannot support the statistic the user asked for."""
     tool = data.get("tool_used")
     sql = (data.get("sql_query") or "").strip()
@@ -697,6 +711,20 @@ def sql_sanity_issue(query: str, data: dict) -> str | None:
         return "a data question was answered without any SQL"
     if not AGG_SQL_RE.search(sql) and not TOPN_SQL_RE.search(sql):
         return "the SQL selects raw rows (no AVG/COUNT/SUM/MIN/MAX/GROUP BY) — the statistic was computed by the model, not by the database"
+    if asks_ratio(query) and not RATIO_EXPR_RE.search(sql):
+        return "the question asks for a rate / percentage but the SQL computes only counts — the rate must be computed in SQL (e.g. 100.0 * SUM(...) / COUNT(*))"
+    # answer assembled from several separate queries (one per group) instead of ONE GROUP BY query
+    if messages:
+        ans_nums = _nums(data.get("answer", ""))
+        contributing = 0
+        for c in executed_sql_calls(messages):
+            if not c["ok"]:
+                continue
+            res_nums = _nums(c["result"])
+            if any(any(abs(a_ - r) <= max(abs(a_) * 0.005, 0.01) for r in res_nums) for a_ in ans_nums):
+                contributing += 1
+        if contributing >= 2 and not re.search(r"\bgroup\s+by\b", sql, re.IGNORECASE):
+            return f"the answer was assembled from {contributing} separate queries — write ONE query (GROUP BY or conditional aggregation) that returns all the groups in a single result"
     return None
 
 def sql_sanity_correction(reason: str, data: dict) -> str:
@@ -767,6 +795,16 @@ def run_agent(query: str, status=None) -> dict:
     if categories:
         say(f"זוהתה קטגוריית מדיניות: {', '.join(c['label'] for c in categories)} — מזריק {sum(len(c['sections']) for c in categories)} סעיפים")
 
+    # Vague qualifier, no number, no policy definition → ask for clarification; do not let the model guess
+    vague = ambiguous_term(query, categories)
+    if vague:
+        say(f"מונח עמום ללא סף: \"{vague}\" — מבקש הבהרה במקום לנחש")
+        timings["total"] = f"{time.time() - t0:.1f}s (no model call)"
+        st.session_state["last_timings"] = timings
+        return {"answer": clarification_for(vague, query), "sql_query": "", "tool_used": "none",
+                "confidence_score": 40, "output_format": "text", "table_data": [], "policy_sources": [],
+                "data_coverage": {"checked": [], "missing": []}, "_clarification": {"term": vague}}
+
     agent_input = query + build_policy_context(categories, enforce_sql) if categories else query
     say("מריץ את הסוכן (ניסיון 1)...")
     t1 = time.time()
@@ -775,7 +813,7 @@ def run_agent(query: str, status=None) -> dict:
     data = parse_agent_output(result)
 
     # SQL sanity (all data questions): statistic computed in SQL? one correction round if not
-    issue = sql_sanity_issue(query, data)
+    issue = sql_sanity_issue(query, data, result.get("messages"))
     sql_retried = False
     if issue:
         say(f"בדיקת SQL נכשלה ({issue}) — סבב תיקון...")
@@ -783,12 +821,18 @@ def run_agent(query: str, status=None) -> dict:
         result = _invoke_agent(result["messages"] + [("human", sql_sanity_correction(issue, data))])
         timings["sql correction"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
         data = parse_agent_output(result)
-        issue = sql_sanity_issue(query, data)
+        issue = sql_sanity_issue(query, data, result.get("messages"))
         sql_retried = True
     if sql_retried or issue:
         data["_sql_sanity"] = {"ok": issue is None, "reason": issue, "retried": sql_retried}
 
     if not categories:
+        # a plain data question must not be labelled "policy"/"hybrid" just because the model peeked at the policy
+        if data.get("tool_used") in ("policy", "hybrid") and not POLICY_INTENT_RE.search(query):
+            data["tool_used"] = "database" if (data.get("sql_query") or "").strip() else data["tool_used"]
+            if data["tool_used"] == "database":
+                data["policy_sources"] = []
+                data["_routing_normalized"] = True
         timings["total"] = f"{time.time() - t0:.1f}s"
         st.session_state["last_timings"] = timings
         return apply_format_requests(query, data)
