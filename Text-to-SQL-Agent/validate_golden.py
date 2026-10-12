@@ -43,7 +43,10 @@ def monthly_payment(principal, annual_rate_percent, term_months):
 
 
 def compound_interest(principal, annual_rate_percent, years):
-    fv = principal * (1 + annual_rate_percent / 100) ** years
+    # monthly compounding — must stay identical to calculate_compound_interest in app.py
+    monthly_rate = annual_rate_percent / 100 / 12
+    months = int(round(years * 12))
+    fv = principal * (1 + monthly_rate) ** months
     return {"future_value": round(fv, 2), "interest_earned": round(fv - principal, 2)}
 
 

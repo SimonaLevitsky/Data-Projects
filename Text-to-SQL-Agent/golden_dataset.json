@@ -238,13 +238,13 @@
         "years": 10
       },
       "expected_values": {
-        "future_value": 148024.43,
-        "interest_earned": 48024.43
+        "future_value": 149083.27,
+        "interest_earned": 49083.27
       },
       "required_values": [
         "future_value"
       ],
-      "notes": "Annual compounding."
+      "notes": "Monthly compounding (annual rate / 12, years * 12 periods)."
     },
     {
       "id": "Q11",

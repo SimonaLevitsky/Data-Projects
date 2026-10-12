@@ -195,14 +195,16 @@ def calculate_monthly_payment(principal: float, annual_rate_percent: float, term
 def calculate_compound_interest(principal: float, annual_rate_percent: float, years: int) -> str:
     """
     Calculate compound interest and the future value of a principal amount.
+    Interest is compounded MONTHLY: the annual rate is divided by 12 and applied for years*12 periods.
     Use when the user asks: 'if I invest/deposit X at Y% for Z years, how much will I have?'
     or any question about future value, compound growth, or interest earned over time.
     principal: starting amount.
     annual_rate_percent: annual interest rate as a percentage.
     years: number of years.
     """
-    r = annual_rate_percent / 100
-    future_value = principal * (1 + r) ** years
+    monthly_rate = annual_rate_percent / 100 / 12
+    months = int(round(years * 12))
+    future_value = principal * (1 + monthly_rate) ** months
     interest_earned = future_value - principal
 
     return json.dumps({
@@ -210,6 +212,8 @@ def calculate_compound_interest(principal: float, annual_rate_percent: float, ye
         "principal": round(principal, 2),
         "annual_rate_percent": annual_rate_percent,
         "years": years,
+        "compounding": "monthly",
+        "periods": months,
         "future_value": round(future_value, 2),
         "interest_earned": round(interest_earned, 2)
     })
