@@ -16,7 +16,8 @@ import policy_enforcement
 from policy_enforcement import (scan_policy, detect_policy_categories, build_policy_context,
                                 check_completeness, build_correction, wants_data,
                                 sanitize_policy_answer, final_confidence,
-                                asks_ratio, RATIO_EXPR_RE, POLICY_INTENT_RE, ambiguous_term, clarification_for)
+                                asks_ratio, RATIO_EXPR_RE, POLICY_INTENT_RE, ambiguous_term, clarification_for,
+                                question_lang)
 
 REQUIRED_ENFORCEMENT_VERSION = 3
 
@@ -140,15 +141,13 @@ with st.sidebar:
             st.success(f"OK in {time.time() - _t:.1f}s — {st.session_state['index_info']['source']}")
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
-    with st.expander("ℹ️ איך לקרוא את ציון הביטחון"):
+    with st.expander("ℹ️ How to read the confidence score"):
         st.markdown(
-            '<div dir="rtl" style="direction: rtl; text-align: right; font-size: 0.85em;">\n\n'
-            "- **90–100** — שאלה חד-משמעית, התאמה מדויקת לנתונים או למדיניות.\n"
-            "- **70–89** — נדרשה פרשנות קלה, ההנחה מצוינת בתשובה.\n"
-            "- **50–69** — שאלה עמומה. התשובה חסומה, מוצגת בקשת הבהרה.\n"
-            "- **0** — מחוץ לתחום או נתון שאינו קיים במערכת.\n\n"
-            "הסף של 70 נאכף בקוד, לא רק על ידי המודל.\n\n</div>",
-            unsafe_allow_html=True,
+            "- **90–100** — unambiguous question, exact match to the data or the policy.\n"
+            "- **70–89** — minor interpretation required; the assumption is stated in the answer.\n"
+            "- **50–69** — ambiguous question. The answer is blocked and a clarification request is shown.\n"
+            "- **0** — out of domain, or data that does not exist in the system.\n\n"
+            "The threshold of 70 is enforced in code, not only by the model."
         )
     _lt = st.session_state.get("last_timings")
     if _lt:
@@ -788,6 +787,37 @@ def _invoke_agent(messages: list) -> dict:
     return agent.invoke({"messages": messages}, config={"recursion_limit": AGENT_RECURSION_LIMIT})
 
 
+STATUS_TEXT = {
+    "he": {
+        "analyzing": "מנתח את הנתונים...",
+        "done": "הניתוח הושלם",
+        "error": "שגיאה: {name}",
+        "error_answer": "אופס, אירעה שגיאה ({name}): {err}",
+        "category": "זוהתה קטגוריית מדיניות: {cats} — מזריק {n} סעיפים",
+        "vague": "מונח עמום ללא סף: \"{term}\" — מבקש הבהרה במקום לנחש",
+        "attempt1": "מריץ את הסוכן (ניסיון 1)...",
+        "sql_failed": "בדיקת SQL נכשלה ({issue}) — סבב תיקון...",
+        "complete_failed": "בדיקת שלמות נכשלה (חסר: {missing}) — סבב תיקון {n}...",
+        "cleaned": "ניקוי אוטומטי: ",
+        "complete_ok": "בדיקת שלמות עברה ✅",
+        "complete_still_failing": "בדיקת שלמות עדיין נכשלת — מציג תשובה חלקית ⚠️",
+    },
+    "en": {
+        "analyzing": "Analyzing the data...",
+        "done": "Analysis complete",
+        "error": "Error: {name}",
+        "error_answer": "Oops, an error occurred ({name}): {err}",
+        "category": "Policy category detected: {cats} — injecting {n} sections",
+        "vague": "Vague term without a threshold: \"{term}\" — asking for clarification instead of guessing",
+        "attempt1": "Running the agent (attempt 1)...",
+        "sql_failed": "SQL check failed ({issue}) — correction round...",
+        "complete_failed": "Completeness check failed (missing: {missing}) — correction round {n}...",
+        "cleaned": "Auto-clean: ",
+        "complete_ok": "Completeness check passed ✅",
+        "complete_still_failing": "Completeness check still failing — showing a partial answer ⚠️",
+    },
+}
+
 def run_agent(query: str, status=None) -> dict:
     """
     Run the agent. If the question mentions a policy-defined category (High Risk, Tier 4, Prime...):
@@ -797,6 +827,9 @@ def run_agent(query: str, status=None) -> dict:
     The verdict is attached under data["_completeness"] and surfaced in the UI.
     `status` is an optional st.status container used to show progress and timings.
     """
+    lang = question_lang(query)
+    T = STATUS_TEXT[lang]
+
     def say(msg):
         if status is not None:
             status.update(label=msg)
@@ -807,12 +840,12 @@ def run_agent(query: str, status=None) -> dict:
     categories = detect_policy_categories(query, policy_chunks)
     enforce_sql = bool(categories) and categories[0].get("mode") == "membership"
     if categories:
-        say(f"זוהתה קטגוריית מדיניות: {', '.join(c['label'] for c in categories)} — מזריק {sum(len(c['sections']) for c in categories)} סעיפים")
+        say(T["category"].format(cats=", ".join(c["label"] for c in categories), n=sum(len(c["sections"]) for c in categories)))
 
     # Vague qualifier, no number, no policy definition → ask for clarification; do not let the model guess
     vague = ambiguous_term(query, categories)
     if vague:
-        say(f"מונח עמום ללא סף: \"{vague}\" — מבקש הבהרה במקום לנחש")
+        say(T["vague"].format(term=vague))
         timings["total"] = f"{time.time() - t0:.1f}s (no model call)"
         st.session_state["last_timings"] = timings
         return {"answer": clarification_for(vague, query), "sql_query": "", "tool_used": "none",
@@ -820,7 +853,7 @@ def run_agent(query: str, status=None) -> dict:
                 "data_coverage": {"checked": [], "missing": []}, "_clarification": {"term": vague}}
 
     agent_input = query + build_policy_context(categories, enforce_sql, query) if categories else query
-    say("מריץ את הסוכן (ניסיון 1)...")
+    say(T["attempt1"])
     t1 = time.time()
     result = _invoke_agent([("human", agent_input)])
     timings["attempt 1"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
@@ -830,7 +863,7 @@ def run_agent(query: str, status=None) -> dict:
     issue = sql_sanity_issue(query, data, result.get("messages"))
     sql_retried = False
     if issue:
-        say(f"בדיקת SQL נכשלה ({issue}) — סבב תיקון...")
+        say(T["sql_failed"].format(issue=issue))
         t1 = time.time()
         result = _invoke_agent(result["messages"] + [("human", sql_sanity_correction(issue, data))])
         timings["sql correction"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
@@ -855,7 +888,7 @@ def run_agent(query: str, status=None) -> dict:
     report = check_completeness(data, categories, enforce_sql, query)
     while not report["ok"] and retries < MAX_COMPLETENESS_RETRIES:
         retries += 1
-        say(f"בדיקת שלמות נכשלה (חסר: {report['missing_sections'] + report['missing_columns']}) — סבב תיקון {retries}...")
+        say(T["complete_failed"].format(missing=report["missing_sections"] + report["missing_columns"], n=retries))
         t1 = time.time()
         result = _invoke_agent(result["messages"] + [("human", build_correction(report))])
         timings[f"correction {retries}"] = f"{time.time() - t1:.1f}s · {len(result.get('messages', []))} messages"
@@ -865,11 +898,11 @@ def run_agent(query: str, status=None) -> dict:
     # Deterministic clean-up of whatever the model still got wrong, then re-check the cleaned answer
     cleaned = sanitize_policy_answer(data, categories, report, query)
     if cleaned:
-        say("ניקוי אוטומטי: " + "; ".join(cleaned))
+        say(T["cleaned"] + "; ".join(cleaned))
         report = check_completeness(data, categories, enforce_sql, query)
     data["confidence_score"] = final_confidence(data, report)
 
-    say("בדיקת שלמות עברה ✅" if report["ok"] else "בדיקת שלמות עדיין נכשלת — מציג תשובה חלקית ⚠️")
+    say(T["complete_ok"] if report["ok"] else T["complete_still_failing"])
     data["_completeness"] = {
         "categories": [c["label"] for c in categories],
         "retries": retries,
@@ -1086,17 +1119,17 @@ if "messages" not in st.session_state:
 
 if not st.session_state.messages:
     st.markdown("""
-<div style="direction: rtl; text-align: right; background-color: #e8f4fd; border-left: 4px solid #1f77b4; border-radius: 6px; padding: 16px; margin-bottom: 16px;">
-<strong>💡 דוגמאות לשאלות שתוכלו לשאול:</strong>
+<div style="direction: ltr; text-align: left; background-color: #e8f4fd; border-left: 4px solid #1f77b4; border-radius: 6px; padding: 16px; margin-bottom: 16px;">
+<strong>💡 Example questions you can ask (Hebrew or English):</strong>
 <ul style="margin-top: 8px; margin-bottom: 0;">
-<li>מה אחוז ה-Default בתיק? הצג טבלה ושאילתה</li>
-<li>מה ממוצע ה-Credit Score של לקוחות ב-Default לעומת תקינים?</li>
-<li>מה ההחזר החודשי על הלוואה של 50,000 ₪ בריבית 6% ל-5 שנים?</li>
-<li>לקוח מרוויח 8,000 ₪ בחודש ומשלם 2,400 ₪. מה יחס ה-DTI שלו?</li>
-<li>מה שיעור הכשל הממוצע לפי מצב משפחתי? תציג שאילתה</li>
-<li>אם אשקיע 100,000 ₪ בריבית 4% ל-10 שנים, כמה אקבל?</li>
-<li>📜 מה המדיניות אומרת לגבי יחס DTI מקסימלי?</li>
-<li>📜 כמה לקוחות בתיק נחשבים High Risk לפי המדיניות? הצג שאילתה</li>
+<li>What is the default rate in the portfolio? Show the table and the query</li>
+<li>What is the average credit score of clients in default vs performing clients?</li>
+<li>What is the monthly payment on a 50,000 ILS loan at 6% for 5 years?</li>
+<li>A client earns 8,000 ILS a month and pays 2,400 ILS. What is their DTI ratio?</li>
+<li>What is the default rate by marital status? Show the query</li>
+<li>If I invest 100,000 ILS at 4% for 10 years, how much will I get?</li>
+<li>📜 What does the policy say about the maximum DTI ratio?</li>
+<li>📜 How many clients in the portfolio are High Risk according to the policy? Show the query</li>
 </ul>
 </div>
 """, unsafe_allow_html=True)
@@ -1108,7 +1141,7 @@ for message in st.session_state.messages:
         else:
             rtl_markdown(message["content"])
 
-user_query = st.chat_input("שאלו שאלה על תיק האשראי או בקשו חישוב פיננסי...")
+user_query = st.chat_input("Ask about the loan portfolio, request a financial calculation, or consult the policy (Hebrew or English)...")
 
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
@@ -1116,14 +1149,15 @@ if user_query:
         rtl_markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.status("מנתח את הנתונים...", expanded=False) as status:
+        _T = STATUS_TEXT[question_lang(user_query)]
+        with st.status(_T["analyzing"], expanded=False) as status:
             try:
                 data = run_agent(user_query, status=status)
-                status.update(label="הניתוח הושלם", state="complete")
+                status.update(label=_T["done"], state="complete")
             except Exception as e:
-                status.update(label=f"שגיאה: {type(e).__name__}", state="error")
+                status.update(label=_T["error"].format(name=type(e).__name__), state="error")
                 data = {
-                    "answer": f"אופס, אירעה שגיאה ({type(e).__name__}): {e}",
+                    "answer": _T["error_answer"].format(name=type(e).__name__, err=e),
                     "sql_query": "", "tool_used": "none",
                     "confidence_score": 0, "output_format": "text", "table_data": []
                 }
