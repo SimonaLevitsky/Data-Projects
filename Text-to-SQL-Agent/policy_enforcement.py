@@ -180,6 +180,31 @@ MEMBERSHIP_RE = re.compile(
     r"(?:אילו|איזה|which|list|רשימת|הצג)\W+(?:\w+\W+){0,1}?(?:לקוח|הלווא|client|loan|borrower)",
     re.IGNORECASE)
 
+HEBREW_RE = re.compile(r"[֐-׿]")
+
+def question_lang(question: str) -> str:
+    """'he' if the question contains Hebrew letters, else 'en'. The answer must follow the question."""
+    return "he" if HEBREW_RE.search(question or "") else "en"
+
+# Fixed labels of the "what was checked in the data" table, per language
+LABELS = {
+    "he": {"metric": "מדד", "value": "ערך",
+           "combined": "לקוחות שעומדים בלפחות קריטריון אחד", "total": "סך כל הלקוחות",
+           "header": "לפי המדיניות, לקוחות בקטגוריית <label> מוגדרים על פי:",
+           "ex1": "לקוחות עם ציון מתחת ל-550", "ex2": "לקוחות עם 0–1 שנות תעסוקה",
+           "section": "(סעיף 2.1)"},
+    "en": {"metric": "Metric", "value": "Value",
+           "combined": "Clients meeting at least one criterion", "total": "Total clients",
+           "header": "According to the policy, <label> clients are defined by:",
+           "ex1": "Clients with credit score below 550", "ex2": "Clients with 0–1 years of employment",
+           "section": "(Section 2.1)"},
+}
+FIXED_LABEL_TRANSLATION = {  # Hebrew → English for the two fixed rows and the two keys (used by the sanitizer)
+    "לקוחות שעומדים בלפחות קריטריון אחד": "Clients meeting at least one criterion",
+    "סך כל הלקוחות": "Total clients",
+    "מדד": "Metric", "ערך": "Value",
+}
+
 def question_mode(question: str) -> str:
     return "membership" if MEMBERSHIP_RE.search(normalize_for_match(question)) else "rule"
 
@@ -278,7 +303,7 @@ def detect_policy_categories(question: str, chunks) -> list[dict]:
 # 2. Context injection
 # ─────────────────────────────────────────────
 
-def build_rule_context(categories: list[dict]) -> str:
+def build_rule_context(categories: list[dict], question: str = "") -> str:
     parts = []
     for c in categories:
         lines = []
@@ -305,13 +330,14 @@ def build_rule_context(categories: list[dict]) -> str:
         "3. Cite EVERY section listed above in the answer text, written as the word — Hebrew \"סעיף 8.1\", "
         "English \"Section 8.1\" — never the '§' sign. policy_sources = all of these sections.\n"
         "4. confidence_score 90-100: the answer is grounded in the policy text.\n"
+        f"5. LANGUAGE: the question is in {'Hebrew' if question_lang(question) == 'he' else 'English'} — answer entirely in that language.\n"
         "An answer that omits one of these sections, or that queries the database, will be rejected."
     )
 
 
-def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
+def build_policy_context(categories: list[dict], enforce_sql: bool, question: str = "") -> str:
     if categories and categories[0].get("mode") == "rule":
-        return build_rule_context(categories)
+        return build_rule_context(categories, question)
     parts = []
     for c in categories:
         lines = []
@@ -334,15 +360,18 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
             )
         parts.append(block)
 
+    lang = question_lang(question)
+    L = LABELS[lang]
+    lang_name = "Hebrew" if lang == "he" else "English"
     n_criteria = sum(len(c["sections"]) for c in categories)
     if enforce_sql and n_criteria == 1:
         data_req = (
             "2. There is exactly ONE criterion. Run ONE SQL query over the WHOLE portfolio with: the count of "
             "clients meeting it, and the total — nothing else. No percentage/share/ratio column unless the user "
             "asked for one, no limit-related columns.\n"
-            "3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {\"מדד\": label, \"ערך\": n} "
-            "(English: Metric / Value), in THIS order: the criterion row, then \"סך כל הלקוחות\" / \"Total clients\". "
-            "Do NOT add a \"לקוחות שעומדים בלפחות קריטריון אחד\" row — it is meaningless with a single criterion. "
+            f"3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {{\"{L['metric']}\": label, \"{L['value']}\": n}}, "
+            f"in THIS order: the criterion row, then \"{L['total']}\". "
+            f"Do NOT add a \"{L['combined']}\" row — it is meaningless with a single criterion. "
             "No other rows. Set output_format to \"table+text\" (+sql if the user asked for the query).\n"
         )
     elif enforce_sql:
@@ -351,11 +380,9 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
             "standalone); ONE combined count = clients meeting AT LEAST ONE criterion (OR over the criteria); "
             "and the total. No limit-related columns, no AND-combinations, no percentage/share/ratio columns "
             "unless the user asked for them.\n"
-            "3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {\"מדד\": label, \"ערך\": n} "
-            "(English: Metric / Value), in THIS order: one row per criterion in bullet order (e.g. "
-            "\"לקוחות עם ציון מתחת ל-550\", \"לקוחות עם 0–1 שנות תעסוקה\"), then EXACTLY "
-            "\"לקוחות שעומדים בלפחות קריטריון אחד\" / \"Clients meeting at least one criterion\", then "
-            "\"סך כל הלקוחות\" / \"Total clients\". No other rows, no percentage/share/ratio rows. "
+            f"3. Put the numbers in \"table_data\" ONLY (not in \"answer\"), rows {{\"{L['metric']}\": label, \"{L['value']}\": n}}, "
+            f"in THIS order: one row per criterion in bullet order (e.g. \"{L['ex1']}\", \"{L['ex2']}\"), "
+            f"then EXACTLY \"{L['combined']}\", then \"{L['total']}\". No other rows, no percentage/share/ratio rows. "
             "Set output_format to \"table+text\" (+sql if the user asked for the query).\n"
         )
     else:
@@ -366,11 +393,12 @@ def build_policy_context(categories: list[dict], enforce_sql: bool) -> str:
         "sections for the category in the question; you do not need to call find_all_policy_mentions again.]\n"
         + "\n\n".join(parts)
         + "\n\nREQUIREMENTS FOR YOUR ANSWER (MANDATORY WORKFLOW):\n"
-        "1. \"answer\" = the policy definition ONLY: the header line (\"לפי המדיניות, לקוחות בקטגוריית <label> "
-        "מוגדרים על פי:\" / \"According to the policy, <label> clients are defined by:\") followed by ONE bullet "
+        f"0. LANGUAGE: the question is in {lang_name}. EVERYTHING you write — the answer text, every table label, "
+        f"the table keys — must be in {lang_name}. Do not mix languages.\n"
+        f"1. \"answer\" = the policy definition ONLY: the header line (\"{L['header']}\") followed by ONE bullet "
         "PER CRITERION SECTION listed above, in section order, each ending with its section number — written as "
-        "the word, NEVER the '§' sign: Hebrew '(סעיף 2.1)', English '(Section 2.1)'. Use ONLY the criterion "
-        "section numbers given here. No numbers/counts inside \"answer\".\n"
+        f"the word, NEVER the '§' sign, e.g. {L['section']}. Use ONLY the criterion section numbers given here. "
+        "No numbers/counts inside \"answer\".\n"
         + data_req +
         "4. \"data_coverage.checked\" = the criteria you verified, with sections. \"data_coverage.missing\" = "
         "ONLY criteria that cannot be checked in the data (e.g. DTI, missed payments) — leave it EMPTY when every "
@@ -410,14 +438,19 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool, qu
 
     if categories and categories[0].get("mode") == "rule":
         unexpected_sql = bool(sql.strip())
+        lang = question_lang(question)
+        wrong_language = bool(question) and ((lang == "en" and bool(HEBREW_RE.search(answer_text))) or
+                                             (lang == "he" and not HEBREW_RE.search(answer_text)))
         return {
             "mode": "rule",
+            "lang": lang,
+            "wrong_language": wrong_language,
             "expected_sections": expected_sections, "excluded_sections": [], "expected_columns": [],
             "has_unverifiable": False,
             "missing_sections": missing_sections, "missing_in_sources": missing_in_sources,
             "unexpected_sections": [], "missing_columns": [], "multi_statement": False,
             "forbidden_columns_used": [], "unexpected_sql": unexpected_sql,
-            "ok": not (missing_sections or missing_in_sources or unexpected_sql),
+            "ok": not (missing_sections or missing_in_sources or unexpected_sql or wrong_language),
         }
     unexpected_sections = [s for s in excluded_sections if s in in_answer or s in in_sources]
     missing_columns = [c for c in expected_columns if c not in sql] if (enforce_sql or sql) else []
@@ -434,8 +467,20 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool, qu
     labels = [str(next(iter(r.values()), "")) for r in rows]
     redundant_combined_row = single and any(COMBINED_LABEL_RE.search(l) for l in labels)
     unrequested_ratio_row = (not asks_ratio(question)) and any(RATIO_Q_RE.search(l) for l in labels)
+    # language: an English question must get English labels/keys and an English answer (and vice versa)
+    lang = question_lang(question)
+    keys = [k for r in rows for k in r.keys()]
+    has_he = lambda s: bool(HEBREW_RE.search(str(s)))
+    if not question:
+        wrong_language = False          # no question available → nothing to compare against
+    elif lang == "en":
+        wrong_language = any(has_he(x) for x in labels + keys) or has_he(data.get("answer", ""))
+    else:
+        wrong_language = bool(rows) and not any(has_he(x) for x in labels)
     return {
         "mode": "membership",
+        "lang": lang,
+        "wrong_language": wrong_language,
         "single_criterion": single,
         "unrequested_ratio": unrequested_ratio,
         "redundant_combined_row": redundant_combined_row,
@@ -453,7 +498,7 @@ def check_completeness(data: dict, categories: list[dict], enforce_sql: bool, qu
         "forbidden_columns_used": forbidden_columns_used,  # limit columns (e.g. loan_amount) in the SQL
         "ok": not (missing_sections or missing_in_sources or unexpected_sections or missing_columns
                    or multi_statement or forbidden_columns_used or unrequested_ratio
-                   or redundant_combined_row or unrequested_ratio_row),
+                   or redundant_combined_row or unrequested_ratio_row or wrong_language),
     }
 
 
@@ -477,6 +522,7 @@ def sanitize_policy_answer(data: dict, categories: list[dict], report: dict, que
         cov = data.get("data_coverage")
         if isinstance(cov, dict):
             cov["checked"], cov["missing"] = [], []
+        data["lang"] = report.get("lang", question_lang(question))
         return notes
 
     # 1. SQL: keep only the first statement (the per-criterion count query)
@@ -535,6 +581,26 @@ def sanitize_policy_answer(data: dict, categories: list[dict], report: dict, que
         cov["missing"] = []
         notes.append("cleared the 'cannot be verified' list (all criteria are verifiable in the DB)")
 
+    # 5b. language of the fixed table labels/keys follows the question (free-text criterion labels are left
+    #     to the correction round; the two fixed rows and the two keys are translated deterministically)
+    data["lang"] = report.get("lang", question_lang(question))
+    if data["lang"] == "en":
+        translated = False
+        new_rows = []
+        for r in (data.get("table_data") or []):
+            if not isinstance(r, dict):
+                new_rows.append(r); continue
+            nr = {}
+            for k, v in r.items():
+                nk = FIXED_LABEL_TRANSLATION.get(str(k).strip(), k)
+                nv = FIXED_LABEL_TRANSLATION.get(str(v).strip(), v) if isinstance(v, str) else v
+                translated |= (nk != k) or (nv != v)
+                nr[nk] = nv
+            new_rows.append(nr)
+        if translated:
+            data["table_data"] = new_rows
+            notes.append("translated fixed table labels to English")
+
     # 6. routing label is a fact, not a self-report: policy context was injected AND SQL ran → hybrid
     if (data.get("sql_query") or "").strip() and data.get("tool_used") != "hybrid":
         data["tool_used"] = "hybrid"
@@ -575,6 +641,10 @@ def build_correction(report: dict) -> str:
                 + ", ".join("Section " + s for s in report["unexpected_sections"]) + "\n")
     if report["missing_columns"]:
         msg += "- DB columns your SQL did not check: " + ", ".join(report["missing_columns"]) + "\n"
+    if report.get("wrong_language"):
+        lang_name = "English" if report.get("lang") == "en" else "Hebrew"
+        msg += (f"- WRONG LANGUAGE: the question is in {lang_name}. Rewrite the answer text, every table label and "
+                f"the table keys entirely in {lang_name}.\n")
     if report.get("unexpected_sql"):
         msg += ("- This question asks what the POLICY says (a rule / limit), not about the portfolio: do NOT query "
                 "the database. Set sql_query to \"\", table_data to [], tool_used to \"policy\", and answer from the "

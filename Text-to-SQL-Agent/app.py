@@ -819,7 +819,7 @@ def run_agent(query: str, status=None) -> dict:
                 "confidence_score": 40, "output_format": "text", "table_data": [], "policy_sources": [],
                 "data_coverage": {"checked": [], "missing": []}, "_clarification": {"term": vague}}
 
-    agent_input = query + build_policy_context(categories, enforce_sql) if categories else query
+    agent_input = query + build_policy_context(categories, enforce_sql, query) if categories else query
     say("מריץ את הסוכן (ניסיון 1)...")
     t1 = time.time()
     result = _invoke_agent([("human", agent_input)])
@@ -919,9 +919,13 @@ def markdown_table(rows: list) -> str:
     lines += ["| " + " | ".join(esc(r.get(c, "")) for c in cols) + " |" for r in rows]
     return "\n".join(lines)
 
-def render_policy_answer(answer: str, table_data: list, missing: list):
-    """Fixed layout for policy-category answers: definition → 'checked in the data' table → limitations."""
-    hebrew = is_hebrew(answer) or any(is_hebrew(str(v)) for r in table_data if isinstance(r, dict) for v in r.values())
+def render_policy_answer(answer: str, table_data: list, missing: list, lang: str | None = None):
+    """Fixed layout for policy-category answers: definition → 'checked in the data' table → limitations.
+    The layout language follows the QUESTION's language (data["lang"]), not the table's content."""
+    if lang in ("he", "en"):
+        hebrew = lang == "he"
+    else:
+        hebrew = is_hebrew(answer) or any(is_hebrew(str(v)) for r in table_data if isinstance(r, dict) for v in r.values())
     rtl_markdown(answer)
 
     rows = order_policy_rows([r for r in table_data if isinstance(r, dict) and r])
@@ -1022,7 +1026,7 @@ def render_response(data: dict):
 
     if is_policy_answer:
         # Fixed layout: 1) policy definition  2) "checked in the data" table  3) data limitations
-        render_policy_answer(answer, table_data, missing)
+        render_policy_answer(answer, table_data, missing, data.get("lang"))
     else:
         # תשובה מילולית
         if answer and ("text" in fmt or "table" not in fmt):
